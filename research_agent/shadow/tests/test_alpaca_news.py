@@ -88,6 +88,14 @@ def test_get_news_text_and_cutoff(store, monkeypatch):
     assert alpaca_news.get_news("NVDA", "2026-08-25", "2026-08-25").startswith("No news found")
 
 
+def test_spread_by_day_caps_each_day_newest_first():
+    newest_first = [{"id": f"{d}-{i}", "created_at": f"2026-08-{d}T{20 - i:02d}:00:00Z"}
+                    for d in (28, 27, 26) for i in range(6)]
+    picked = alpaca_news.spread_by_day(newest_first, total=10, per_day=4)
+    assert [a["id"] for a in picked] == [
+        "28-0", "28-1", "28-2", "28-3", "27-0", "27-1", "27-2", "27-3", "26-0", "26-1"]
+
+
 def test_register_routes_news_tools_only():
     from tradingagents.dataflows import router
     from tradingagents.dataflows.config import run_config

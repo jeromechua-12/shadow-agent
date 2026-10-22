@@ -88,10 +88,11 @@ Changes for this project:
 ## Environment and data status (as of 2026-10-22)
 
 - Working branch: `yt`. Windows, PowerShell, venv at research_agent/.venv.
-- research_agent/.env holds OPENROUTER_API_KEY, ALPACA_API_KEY_ID, ALPACA_API_SECRET_KEY.
-  FRED_API_KEY is not set yet (FRED site was down): code must run without it, record that FRED
-  was missing, and allow rerunning those runs once the key is added.
-- LLM: DeepSeek V4 Flash via OpenRouter, temperature 0.0, max tokens 8192.
+- research_agent/.env holds OPENROUTER_API_KEY, ALPACA_API_KEY_ID, ALPACA_API_SECRET_KEY,
+  SEC_EDGAR_USER_AGENT and FRED_API_KEY (FRED available since 2026-10-22). Code must still run
+  without a key, record the source as not_configured, and allow rerunning with --rerun-incomplete.
+- LLM: DeepSeek V4 Flash via OpenRouter, temperature 0.0, max tokens 16384. (8192 was too low:
+  hidden reasoning used up the cap and agents returned empty text, finish_reason=length.)
   OpenRouter budget is limited (about $15); one full TradingAgents run cost about $0.02.
 - Test runs showed, for past dates:
   - prices, technical indicators, financial statements: work
@@ -99,6 +100,8 @@ Changes for this project:
   - StockTwits: HTTP 403 for any date
   - Reddit: only works for recent dates
   - Polymarket and valuation metrics: withheld for past dates on purpose (look-ahead guard)
+  - FRED macro indicators: work (vintage pinned to the analysis date)
+- Financial statements use tool_vendors "sec_edgar,yfinance" (EDGAR by filing date first).
 - News source for past dates: Alpaca news API (historical Benzinga news, free account, tested OK).
   GET https://data.alpaca.markets/v1beta1/news with params symbols, start, end, limit (max 50),
   page_token; headers APCA-API-KEY-ID and APCA-API-SECRET-KEY. Use created_at (not updated_at)

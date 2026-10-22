@@ -34,6 +34,7 @@ from pathlib import Path
 
 import requests
 
+from shadow.data import evidence
 from shadow.data.paths import load_env, warehouse_dir
 from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.date_window import in_window
@@ -44,6 +45,9 @@ logger = logging.getLogger(__name__)
 API_URL = "https://data.alpaca.markets/v1beta1/news"
 PAGE_LIMIT = 50  # the API maximum
 MAX_RETRIES = 5
+# At most this many articles per UTC day, so one busy day cannot fill the whole
+# article limit and hide the rest of the window.
+MAX_PER_DAY = 4
 GLOBAL_KEY = "_global"
 # Market-wide ETFs standing in for "global news": Alpaca has no topic search,
 # and a query with no symbols returns every article for every ticker.
@@ -248,6 +252,24 @@ def default_store() -> AlpacaNewsStore:
     return _default_store
 
 
+def spread_by_day(articles: list[dict], total: int, per_day: int = MAX_PER_DAY) -> list[dict]:
+    """Up to ``total`` articles, at most ``per_day`` from each UTC day.
+
+    ``articles`` must be newest first; the result keeps that order, so the
+    newest days fill first and each day contributes its newest articles.
+    """
+    taken: Counter = Counter()
+    out = []
+    for a in articles:
+        day = _parse_ts(a["created_at"]).astimezone(timezone.utc).date()
+        if taken[day] < per_day:
+            taken[day] += 1
+            out.append(a)
+            if len(out) == total:
+                break
+    return out
+
+
 def _format(articles: list[dict]) -> str:
     """Article list in the Yahoo vendor's layout, plus the creation time."""
     out = ""
@@ -271,7 +293,8 @@ def get_news(ticker: str, start_date: str, end_date: str) -> str:
     symbol = ticker.upper()
     start, end = date.fromisoformat(start_date), date.fromisoformat(end_date)
     store.ensure(symbol, [symbol], start, end)
-    articles = store.articles_between(symbol, start, end)[: get_config()["news_article_limit"]]
+    articles = spread_by_day(store.articles_between(symbol, start, end), get_config()["news_article_limit"])
+    evidence.note_items("alpaca_news", symbol, [a["id"] for a in articles])
     if not articles:
         return f"No news found for {ticker} between {start_date} and {end_date}"
     return f"## {ticker} News, from {start_date} to {end_date}:\n\n{_format(articles)}"
@@ -288,7 +311,8 @@ def get_global_news(curr_date: str, look_back_days: int | None = None, limit: in
     start = end - timedelta(days=look_back_days)
     store = default_store()
     store.ensure(GLOBAL_KEY, GLOBAL_SYMBOLS, start, end)
-    articles = store.articles_between(GLOBAL_KEY, start, end)[:limit]
+    articles = spread_by_day(store.articles_between(GLOBAL_KEY, start, end), limit)
+    evidence.note_items("alpaca_news", GLOBAL_KEY, [a["id"] for a in articles])
     if not articles:
         return f"No global news found between {start.isoformat()} and {curr_date}"
     return f"## Global Market News, from {start.isoformat()} to {curr_date}:\n\n{_format(articles)}"
