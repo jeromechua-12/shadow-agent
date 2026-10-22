@@ -29,6 +29,8 @@ import os
 import threading
 import time
 from collections import Counter
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -58,6 +60,26 @@ GLOBAL_SYMBOLS = ["SPY", "QQQ", "DIA", "TLT", "GLD", "USO"]
 CONFIG_OVERRIDES = {"tool_vendors": {"get_news": "alpaca", "get_global_news": "alpaca"}}
 
 _lock = threading.Lock()
+
+# The run's analysis date, when one is set. The tools layer already clamps
+# requested windows (as_of_window), but the vendor enforces it too, so a direct
+# call or a future tool change cannot serve news from after the run's date.
+_analysis_date: ContextVar[date | None] = ContextVar("alpaca_news_analysis_date", default=None)
+
+
+@contextmanager
+def analysis_date(day: str | date):
+    """Serve no article created after ``day`` (UTC) to calls made inside this block."""
+    token = _analysis_date.set(day if isinstance(day, date) else date.fromisoformat(day))
+    try:
+        yield
+    finally:
+        _analysis_date.reset(token)
+
+
+def _clamp(end: date) -> date:
+    limit = _analysis_date.get()
+    return min(end, limit) if limit is not None else end
 
 
 def default_store_dir() -> Path:
@@ -291,7 +313,11 @@ def get_news(ticker: str, start_date: str, end_date: str) -> str:
     """Company news for ``ticker`` created in [start_date, end_date] (UTC days)."""
     store = default_store()
     symbol = ticker.upper()
-    start, end = date.fromisoformat(start_date), date.fromisoformat(end_date)
+    start, end = date.fromisoformat(start_date), _clamp(date.fromisoformat(end_date))
+    end_date = end.isoformat()
+    if start > end:
+        evidence.note_items("alpaca_news", symbol, [])
+        return f"No news found for {ticker} between {start_date} and {end_date}"
     store.ensure(symbol, [symbol], start, end)
     articles = spread_by_day(store.articles_between(symbol, start, end), get_config()["news_article_limit"])
     evidence.note_items("alpaca_news", symbol, [a["id"] for a in articles])
@@ -307,7 +333,8 @@ def get_global_news(curr_date: str, look_back_days: int | None = None, limit: in
         look_back_days = config["global_news_lookback_days"]
     if limit is None:
         limit = config["global_news_article_limit"]
-    end = date.fromisoformat(curr_date)
+    end = _clamp(date.fromisoformat(curr_date))
+    curr_date = end.isoformat()
     start = end - timedelta(days=look_back_days)
     store = default_store()
     store.ensure(GLOBAL_KEY, GLOBAL_SYMBOLS, start, end)

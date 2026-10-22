@@ -174,7 +174,7 @@ def run_upstream(ticker: str, trade_date: str, temperature: float = UPSTREAM_TEM
     run_id = uuid.uuid4().hex[:12]
     started_at = datetime.now(timezone.utc)
     t0 = time.perf_counter()
-    with run_config(config), evidence.capture() as rec:
+    with run_config(config), alpaca_news.analysis_date(trade_date), evidence.capture() as rec:
         try:
             # The same initial state propagate() builds, minus the memory log
             # (past_context) and the portfolio, and without settling past decisions.

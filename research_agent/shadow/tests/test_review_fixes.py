@@ -304,3 +304,162 @@ def test_10_past_memos_ignores_checks_from_other_versions(con):
 def test_calendar_fixture_sanity():
     assert CAL[CAL.index(date(2026, 9, 4)) + 1] == date(2026, 9, 8)
     assert date(2026, 9, 4) + timedelta(days=3) not in CAL
+
+
+# ---- 12. a social fetch that raises is still recorded ----------------------------------
+
+def test_12_social_call_that_raises_is_recorded():
+    from shadow.data import evidence
+
+    def fetch_reddit_posts(ticker, **kwargs):
+        raise TimeoutError("read timed out")
+
+    wrapped = evidence._wrap_social("reddit", fetch_reddit_posts)
+    with evidence.capture() as rec, pytest.raises(TimeoutError):
+        wrapped("NVDA", start_date="2026-08-25", end_date="2026-09-01")
+    (call,) = rec.calls
+    assert (call["vendor"], call["status"], call["retryable"]) == ("reddit", "error", True)
+    assert "TimeoutError: read timed out" in call["detail"]
+    assert call["seconds"] is not None and call["output"] is None
+
+
+# ---- 13. install() is safe to call from several threads ---------------------------------
+
+HOOKED = [("tradingagents.agents.tools", "route_to_vendor"),
+          ("tradingagents.agents.analysts.sentiment_analyst", "fetch_stocktwits_messages"),
+          ("tradingagents.agents.analysts.sentiment_analyst", "fetch_reddit_posts"),
+          ("tradingagents.agents.analysts.sentiment_analyst", "render_sentiment_report"),
+          ("tradingagents.agents.managers.research_manager", "render_research_plan"),
+          ("tradingagents.agents.trader.trader", "render_trader_proposal")]
+
+
+def test_13_concurrent_install_wraps_each_hook_once(monkeypatch):
+    import importlib
+    import logging
+    import threading
+    import time
+
+    from shadow.data import evidence
+
+    evidence.install()
+    for mod_name, attr in HOOKED:  # start from the unwrapped functions; restored after the test
+        mod = importlib.import_module(mod_name)
+        fn = getattr(mod, attr)
+        while hasattr(fn, "__shadow_wrapped__"):
+            fn = fn.__shadow_wrapped__
+        monkeypatch.setattr(mod, attr, fn)
+    logger = logging.getLogger("tradingagents")
+    monkeypatch.setattr(logger, "handlers", [h for h in logger.handlers
+                                             if not isinstance(h, evidence._CallLogHandler)])
+    monkeypatch.setattr(evidence, "_installed", False)
+    real_table = evidence._wrap_vendor_table
+    monkeypatch.setattr(evidence, "_wrap_vendor_table", lambda: (time.sleep(0.05), real_table()))
+
+    barrier = threading.Barrier(8)
+    threads = [threading.Thread(target=lambda: (barrier.wait(), evidence.install())) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    for mod_name, attr in HOOKED:
+        fn = getattr(importlib.import_module(mod_name), attr)
+        assert hasattr(fn, "__shadow_wrapped__"), attr
+        assert not hasattr(fn.__shadow_wrapped__, "__shadow_wrapped__"), f"{attr} wrapped twice"
+    assert sum(isinstance(h, evidence._CallLogHandler) for h in logger.handlers) == 1
+
+
+# ---- 14. only a real HTTP 403 means blocked --------------------------------------------
+
+def test_14_a_403_price_in_the_text_is_not_blocked():
+    from shadow.data import evidence
+
+    def fetch_stocktwits_messages(ticker, **kwargs):
+        return "<stocktwits unavailable: last price $403.25, feed timed out>"
+
+    with evidence.capture() as rec:
+        evidence._wrap_social("stocktwits", fetch_stocktwits_messages)("NVDA")
+    assert rec.calls[0]["status"] == "unavailable"
+
+
+@pytest.mark.parametrize("log_line", [
+    "StockTwits fetch failed for NVDA: HTTP Error 403: Forbidden",
+    "Vendor failed: 403 Client Error: Forbidden for url: https://x",
+])
+def test_14_a_real_403_is_blocked(log_line):
+    import logging
+
+    from shadow.data import evidence
+
+    evidence.install()
+
+    def fetch_stocktwits_messages(ticker, **kwargs):
+        logging.getLogger("tradingagents.dataflows.vendors.stocktwits").warning(log_line)
+        return "<stocktwits unavailable: HTTPError>"
+
+    with evidence.capture() as rec:
+        evidence._wrap_social("stocktwits", fetch_stocktwits_messages)("NVDA")
+    assert rec.calls[0]["status"] == "blocked"
+
+
+def test_14_a_403_inside_logged_prices_is_not_blocked():
+    import logging
+
+    from shadow.data import evidence
+
+    evidence.install()
+
+    def fetch_stocktwits_messages(ticker, **kwargs):
+        logging.getLogger("tradingagents.dataflows.vendors.stocktwits").warning(
+            "StockTwits returned stale quote 403.25 for %s", ticker)
+        return "<stocktwits unavailable: stale>"
+
+    with evidence.capture() as rec:
+        evidence._wrap_social("stocktwits", fetch_stocktwits_messages)("NVDA")
+    assert rec.calls[0]["status"] == "unavailable"
+
+
+# ---- 16. the Alpaca vendor refuses items after the analysis date itself --------------------
+
+def test_16_alpaca_vendor_clamps_to_the_analysis_date(tmp_path, monkeypatch):
+    from shadow.data import alpaca_news
+
+    store = AlpacaNewsStore(tmp_path)
+    days = [date(2026, 8, 25) + timedelta(days=i) for i in range(12)]
+    store._append("NVDA", [_article(i, f"{d}T15:00:00Z") for i, d in enumerate(days)])
+    store._append("_global", [_article(100 + i, f"{d}T15:00:00Z") for i, d in enumerate(days)])
+    for key in ("NVDA", "_global"):
+        store._mark_covered(key, None, days)
+    monkeypatch.setattr(alpaca_news, "default_store", lambda: store)
+
+    with alpaca_news.analysis_date("2026-08-28"):
+        text = alpaca_news.get_news("NVDA", "2026-08-25", "2026-09-05")   # asks past the analysis date
+        glob = alpaca_news.get_global_news("2026-09-05")
+        later = alpaca_news.get_news("NVDA", "2026-09-01", "2026-09-05")  # wholly after it
+    for t in (text, glob):
+        published = [line.split("Published: ")[1][:10] for line in t.splitlines() if line.startswith("Published: ")]
+        assert published and max(published) <= "2026-08-28"
+    assert "to 2026-08-28" in text and "to 2026-08-28" in glob
+    assert later.startswith("No news found")
+    # Outside an analysis-date scope the vendor serves what it is asked for, as before.
+    assert "2026-09-05" in alpaca_news.get_news("NVDA", "2026-08-25", "2026-09-05")
+
+
+# ---- review's suggested checks ---------------------------------------------------------
+
+def test_check_outcome_dates_follow_calendar(con):
+    add_run(con, "r1", "2026-09-04")
+    (d,) = decide(con, "r1")
+    append_rows(con, "outcomes", [{"decision_id": d, "entry_date": "2026-09-07", "resolved_on": "2026-09-18",
+                                   "stock_return": 0.0, "spy_return": 0.0, "score": 0.0, "label": "noise"}])
+    found = {f.check: f for f in run_checks(con, calendar=CAL) if f.count}
+    assert found["outcome_dates_off_calendar"].examples == [d]
+    skipped = {f.check: f for f in run_checks(con)}["outcome_dates_off_calendar"]
+    assert skipped.severity == "skipped"
+
+
+def test_check_conditions_date_matches_run(con):
+    add_run(con, "r1", "2026-09-04")
+    append_rows(con, "conditions", [{"run_id": "r1", "computed_at": "2026-10-22T10:00:00+00:00",
+                                     "as_of": "2026-09-05", "input_status": {"prices": "ok"}}])
+    assert {f.check: f for f in run_checks(con) if f.count}["conditions_date_mismatch"].examples == ["r1"]

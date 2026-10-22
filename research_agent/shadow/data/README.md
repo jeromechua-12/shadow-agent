@@ -32,7 +32,7 @@ shared, since they are the same for any run that asks for them.
 ```powershell
 python -m shadow.data.loader            # upstream_cache/ -> warehouse/calibration.duckdb
 python -m shadow.data.loader --dev      # sample cache   -> warehouse/dev.duckdb
-python -m shadow.data.checks            # data checks; exits 1 if any error
+python -m shadow.data.checks            # data checks; exits 1 if any error (SKIP = could not run)
 python -m shadow.data.checks --dev
 python -m shadow.data.loader --backfill-conditions   # recompute conditions missing FRED/prices
 ```
@@ -45,6 +45,9 @@ Market conditions (ATR, RSI, VIX, yield curve…) are append-only too: a missing
 (e.g. no FRED key, or `--no-market`) is recorded as `not_configured`, and
 `--backfill-conditions` adds a newer row once it can be filled. Read them through the
 `latest_conditions` view; what each row was computed from is in `condition_inputs`.
+
+The outcome-date check needs a trading calendar; the command line builds it from SPY's
+prices. Called from Python without `calendar=`, that check reports SKIP rather than OK.
 
 The schema has a version (`schema_info`). If the code's version changes, delete the
 database file and load again; the cache files are the source of truth.
@@ -245,5 +248,32 @@ still fails; check `incomplete_runs` after every batch.
 - **Numbers in numeric columns**, never only in text.
 - **No SQL built from agent text.** Use the query functions' filters.
 - **Keep `smoke_test` and samples in `dev.duckdb`.**
+
+## Known limitations
+
+Found in review and deliberately not fixed yet (numbers are the review's).
+
+- **8. Experiments cannot be rerun the append-only way.** `decisions`, `memos` and
+  `book_snapshots` are keyed by `experiment_version` with no run ID, so rerunning an
+  experiment needs a new version string. To be decided with the group.
+- **11. `--max-runs` counts pairs, not LLM runs.** One pair can make up to 8 full runs
+  (2 temperatures × 4 rate-limit attempts), so the real cost of a batch can be higher
+  than `--max-runs` suggests.
+- **15. There is a seventh status, `error`**, a catch-all marked retryable, beyond the
+  six listed in CLAUDE.md.
+- **17. The ticker identity lookup has no evidence row.** It reads today's yfinance
+  profile outside `route_to_vendor`; its text is kept in `outputs.instrument_context`.
+- **18. Superseding can overwrite.** It uses `os.replace`, so two cache files without a
+  `run_id` both become `…unknown.json`, and a complete cache file can be replaced by an
+  incomplete rerun. The database is unaffected: `current_runs` takes the latest
+  complete run.
+- **19. Conditions use adjusted prices** (`auto_adjust=True`), so `close` is not the
+  exact traded price on that date; ratios (ATR %, RSI, distance from the 200-day
+  average) are mostly unaffected.
+- **20. Filter edge cases.** A non-string `trade_date` filter raises `TypeError`
+  instead of `ValueError`, and numeric filters accept NaN and infinity.
+- **21. A two-part decision is not written in one transaction.** If the second part's
+  insert fails, the first part stays.
+- **22. `first_seen_at` falls back to `created_at`** when a news item has no `fetched_at`.
 
 Tests: `python -m pytest shadow/tests -q` (offline, no LLM calls).

@@ -29,7 +29,7 @@ TOLERANCE = 1e-9
 @dataclass
 class Finding:
     check: str
-    severity: str  # error | warning
+    severity: str  # error | warning | skipped (a check that could not run)
     description: str
     count: int
     examples: list = field(default_factory=list)
@@ -105,6 +105,8 @@ SQL_CHECKS = {
                                  "(the pair was rerun after deciding)",
         """SELECT DISTINCT d.experiment_version || ' ' || d.run_id FROM decisions d
            WHERE d.run_id NOT IN (SELECT run_id FROM current_runs)"""),
+    "conditions_date_mismatch": ("error", "a conditions row is dated differently from its run's trade date",
+        """SELECT DISTINCT c.run_id FROM conditions c JOIN runs r ON r.run_id = c.run_id WHERE c.as_of <> r.trade_date"""),
     "outcome_horizon_not_10": ("error", "outcome horizon is not 10 trading days",
         "SELECT decision_id FROM outcomes WHERE horizon_days <> 10"),
     "first_memo_not_default_level": ("error", "an experiment version's first memo is not at risk level 3",
@@ -156,7 +158,30 @@ def _check_condition_inputs(con) -> Finding:
                    "market conditions computed without some inputs (e.g. FRED); backfill later", len(bad), bad[:5])
 
 
-def run_checks(con: duckdb.DuckDBPyConnection, warehouse: Path | None = None) -> list[Finding]:
+def _check_outcome_calendar(con, calendar) -> Finding:
+    """entry_date is the next trading day after the trade date; resolved_on the 10th after entry."""
+    name, desc = ("outcome_dates_off_calendar",
+                  "outcome entry is not the next trading day, or resolved_on is not the 10th trading day after entry")
+    if calendar is None:
+        return Finding(name, "skipped", desc + " (no trading calendar given)", 0)
+    from shadow.data.writers import outcome_dates
+
+    days = sorted(calendar)
+    bad = []
+    for decision_id, trade_date, entry, resolved in con.execute(
+            "SELECT o.decision_id, d.trade_date, o.entry_date, o.resolved_on FROM outcomes o "
+            "JOIN decisions d ON d.decision_id = o.decision_id ORDER BY d.trade_date").fetchall():
+        try:
+            want = outcome_dates(trade_date, days)
+        except ValueError:
+            want = (None, None)
+        if (entry, resolved) != want:
+            bad.append(decision_id)
+    return Finding(name, "error", desc, len(bad), bad[:5])
+
+
+def run_checks(con: duckdb.DuckDBPyConnection, warehouse: Path | None = None, calendar=None) -> list[Finding]:
+    """Every check. ``calendar`` (trading days) enables the outcome-date check; without it, it is skipped."""
     findings = []
     for name, (severity, description, sql) in SQL_CHECKS.items():
         ids = [r[0] for r in con.execute(sql).fetchall()]
@@ -164,6 +189,7 @@ def run_checks(con: duckdb.DuckDBPyConnection, warehouse: Path | None = None) ->
     findings.append(_check_args_after_trade_date(con))
     findings.append(_check_payloads(con, Path(warehouse or warehouse_dir())))
     findings.append(_check_condition_inputs(con))
+    findings.append(_check_outcome_calendar(con, calendar))
     return findings
 
 
@@ -187,12 +213,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     con = connect(resolve_db(args.db, args.dev), read_only=True)
     check_schema_version(con, resolve_db(args.db, args.dev))
-    findings = run_checks(con)
+    calendar = None
+    if con.execute("SELECT count(*) FROM outcomes").fetchone()[0]:
+        from shadow.data.conditions import trading_calendar
+        calendar = trading_calendar()  # SPY's trading days (cached prices)
+    findings = run_checks(con, calendar=calendar)
     if args.json:
         print(json.dumps({"overview": overview(con), "findings": [asdict(f) for f in findings]}, indent=1, default=str))
     else:
         for f in findings:
-            mark = "OK  " if f.count == 0 else ("FAIL" if f.severity == "error" else "WARN")
+            mark = ("SKIP" if f.severity == "skipped" else "OK  " if f.count == 0
+                    else "FAIL" if f.severity == "error" else "WARN")
             print(f"{mark} {f.check:36} {f.count:>5}  {f.description}")
             for ex in f.examples:
                 print(f"       e.g. {ex}")

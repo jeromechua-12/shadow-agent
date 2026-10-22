@@ -24,6 +24,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -48,6 +49,8 @@ STATUSES = ("ok", "no_data", "unavailable", "withheld", "blocked", "not_configur
 _WITHHOLDING = {"get_fundamentals", "get_prediction_markets"}
 # Phrases of a source that only serves recent items (date_window.coverage_gap).
 _NO_HISTORY = ("only serves recent items", "window extends past today")
+# How urllib, requests and our own vendors word an HTTP 403.
+_HTTP_403 = re.compile(r"HTTP Error 403\b|\b403 Client Error\b|\bHTTP 403\b|status(?: code)?[ =:]+403\b|\b403 Forbidden\b")
 
 
 @dataclass
@@ -116,8 +119,10 @@ def _refine(call: dict) -> None:
     attempts = call["attempts"]
     if attempts and all(a["status"] == "not_configured" for a in attempts):
         call["status"], call["retryable"] = "not_configured", True
-    evidence = " ".join([call.get("detail") or "", *call["log"], *(a.get("detail") or "" for a in attempts)])
-    if "403" in evidence or "Forbidden" in evidence:
+    # Only error messages and logged warnings count, never the output text: a price
+    # like 403.25 in the payload must not read as an HTTP 403.
+    errors = [*call["log"], *call.get("errors", []), *(a["detail"] for a in attempts if a.get("raised"))]
+    if any(_HTTP_403.search(e or "") for e in errors):
         call["status"], call["retryable"] = "blocked", False
     if not call.get("detail"):
         failed = [a for a in attempts if a["status"] != "ok"]
@@ -157,6 +162,7 @@ def _new_call(kind: str, method: str, args: tuple, kwargs: dict) -> dict:
         "attempts": [],
         "log": [],
         "items": [],
+        "errors": [],  # exception messages (unlike detail, never output text)
         "output": None,
     }
 
@@ -201,6 +207,7 @@ def _wrap_route(original):
         except Exception as e:
             call["status"], call["retryable"] = _exc_status(e)
             call["detail"] = f"{type(e).__name__}: {e}"
+            call["errors"].append(call["detail"])
             _finish(call, started, None)
             _refine(call)
             rec.add(call)
@@ -234,6 +241,7 @@ def _wrap_vendor(method: str, vendor: str, impl):
         except Exception as e:
             attempt["status"] = _exc_status(e)[0]
             attempt["detail"] = f"{type(e).__name__}: {e}"
+            attempt["raised"] = True
             raise
         else:
             # A vendor can report failure in its return value instead of raising.
@@ -251,14 +259,22 @@ def _wrap_vendor(method: str, vendor: str, impl):
     return vendor_impl
 
 
+_table_lock = threading.Lock()
+
+
 def _wrap_vendor_table() -> None:
-    """Wrap every vendor implementation not wrapped yet (vendors can be added late)."""
+    """Wrap every vendor implementation not wrapped yet (vendors can be added late).
+
+    Runs on every routed call, so parallel workers race here; the lock keeps a
+    vendor from being wrapped twice (which would record each attempt twice).
+    """
     from tradingagents.dataflows import router
 
-    for method, impls in router.VENDOR_METHODS.items():
-        for vendor, impl in list(impls.items()):
-            if not hasattr(impl, "__shadow_wrapped__"):
-                impls[vendor] = _wrap_vendor(method, vendor, impl)
+    with _table_lock:
+        for method, impls in router.VENDOR_METHODS.items():
+            for vendor, impl in list(impls.items()):
+                if not hasattr(impl, "__shadow_wrapped__"):
+                    impls[vendor] = _wrap_vendor(method, vendor, impl)
 
 
 def _wrap_social(source: str, original):
@@ -272,6 +288,16 @@ def _wrap_social(source: str, original):
         token = _current_call.set(call)
         try:
             out = original(ticker, *args, **kwargs)
+        except Exception as e:
+            # The fetchers are meant to return a placeholder, but one that raises
+            # must still leave a record of the attempt.
+            call["status"], call["retryable"] = _exc_status(e)
+            call["detail"] = f"{type(e).__name__}: {e}"
+            call["errors"].append(call["detail"])
+            _finish(call, started, None)
+            _refine(call)
+            rec.add(call)
+            raise
         finally:
             _current_call.reset(token)
         call["status"], call["retryable"] = _text_status(original.__name__, out)
@@ -311,29 +337,41 @@ class _CallLogHandler(logging.Handler):
 
 
 _installed = False
+_install_lock = threading.Lock()
+
+
+def _hook(module, attr: str, wrap) -> None:
+    """Wrap module.attr unless it is wrapped already."""
+    fn = getattr(module, attr)
+    if not hasattr(fn, "__shadow_wrapped__"):
+        setattr(module, attr, wrap(fn))
 
 
 def install() -> None:
-    """Install every hook. Idempotent."""
+    """Install every hook. Idempotent and thread-safe (parallel workers may all call it)."""
     global _installed
     if _installed:
         return
-    import tradingagents.agents.analysts.sentiment_analyst as sentiment
-    import tradingagents.agents.managers.research_manager as research_manager
-    import tradingagents.agents.tools as tools
-    import tradingagents.agents.trader.trader as trader
+    with _install_lock:
+        if _installed:
+            return
+        import tradingagents.agents.analysts.sentiment_analyst as sentiment
+        import tradingagents.agents.managers.research_manager as research_manager
+        import tradingagents.agents.tools as tools
+        import tradingagents.agents.trader.trader as trader
 
-    tools.route_to_vendor = _wrap_route(tools.route_to_vendor)
-    sentiment.fetch_stocktwits_messages = _wrap_social("stocktwits", sentiment.fetch_stocktwits_messages)
-    sentiment.fetch_reddit_posts = _wrap_social("reddit", sentiment.fetch_reddit_posts)
-    sentiment.render_sentiment_report = _wrap_render("sentiment_report", sentiment.render_sentiment_report)
-    research_manager.render_research_plan = _wrap_render("research_plan", research_manager.render_research_plan)
-    trader.render_trader_proposal = _wrap_render("trader_proposal", trader.render_trader_proposal)
+        _hook(tools, "route_to_vendor", _wrap_route)
+        _hook(sentiment, "fetch_stocktwits_messages", lambda f: _wrap_social("stocktwits", f))
+        _hook(sentiment, "fetch_reddit_posts", lambda f: _wrap_social("reddit", f))
+        _hook(sentiment, "render_sentiment_report", lambda f: _wrap_render("sentiment_report", f))
+        _hook(research_manager, "render_research_plan", lambda f: _wrap_render("research_plan", f))
+        _hook(trader, "render_trader_proposal", lambda f: _wrap_render("trader_proposal", f))
 
-    handler = _CallLogHandler(level=logging.WARNING)
-    logging.getLogger("tradingagents").addHandler(handler)
-    _wrap_vendor_table()
-    _installed = True
+        logger_ = logging.getLogger("tradingagents")
+        if not any(isinstance(h, _CallLogHandler) for h in logger_.handlers):
+            logger_.addHandler(_CallLogHandler(level=logging.WARNING))
+        _wrap_vendor_table()
+        _installed = True
 
 
 def _write_once(path: Path, text: str) -> None:

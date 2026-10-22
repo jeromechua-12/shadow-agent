@@ -102,7 +102,8 @@ Changes for this project:
   - Polymarket and valuation metrics: withheld for past dates on purpose (look-ahead guard)
   - FRED macro indicators: work (vintage pinned to the analysis date)
 - Financial statements use tool_vendors "sec_edgar,yfinance" (EDGAR by filing date first).
-- Upstream runs use temperature 0.2, with one retry at 0.6 when an agent loops to the token cap.
+- Upstream runs use temperature 0.2. Temperature 0.6 is used only as an automatic retry, once,
+  when a run loops at 0.2 (an agent returns nothing at the token cap); never as a setting.
 - Test runs live in warehouse/sample_upstream_cache/ and load only into warehouse/dev.duckdb.
   The real cache (upstream_cache/) and main DB (warehouse/calibration.duckdb) start empty.
   Known gap in the sample: NVDA 2026-09-08 (Fundamentals Analyst loops at 0.2 and 0.6).
