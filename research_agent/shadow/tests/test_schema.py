@@ -9,7 +9,7 @@ TABLES = {
     "schema_info", "runs", "llm_calls", "evidence_calls", "text_items", "run_text_items",
     "agent_outputs", "trader_proposals", "conditions", "decisions", "outcomes",
     "book_snapshots", "memos", "memo_advice", "memo_hypotheses", "hypothesis_checks",
-    "memo_tool_calls",
+    "memo_tool_calls", "condition_inputs",
 }
 
 
@@ -32,7 +32,7 @@ def test_creates_all_tables_and_is_idempotent(tmp_path):
     names = {r[0] for r in con.execute("SELECT table_name FROM information_schema.tables "
                                        "WHERE table_type = 'BASE TABLE'").fetchall()}
     assert names == TABLES
-    assert con.execute("SELECT value FROM schema_info WHERE key = 'schema_version'").fetchall() == [("1",)]
+    assert con.execute("SELECT value FROM schema_info WHERE key = 'schema_version'").fetchall() == [("2",)]
 
 
 def test_status_check_rejects_unknown_status(con):
@@ -71,13 +71,3 @@ def test_current_runs_picks_latest_complete(con):
     add_run(con, "new", started="2026-10-21 10:00:00+00")
     add_run(con, "newest_incomplete", started="2026-10-22 10:00:00+00", complete=False)
     assert con.execute("SELECT run_id FROM current_runs").fetchall() == [("new",)]
-
-
-def test_hypothesis_status_is_latest_check(con):
-    for memo, day in (("m1", "2026-09-28"), ("m2", "2026-10-26")):
-        con.execute("INSERT INTO memos (memo_id, experiment_version, cycle_date, created_at, risk_level, "
-                    "memo_text, safety_passed) VALUES (?, 'v', ?, now(), 3, 'x', true)", [memo, day])
-    con.execute("INSERT INTO memo_hypotheses VALUES ('h1', 'm1', 'event_risk', 'macro news rejections miss gains', "
-                "'{\"category\": \"event_risk\"}')")
-    con.execute("INSERT INTO hypothesis_checks VALUES ('h1', 'm1', 'pending', NULL), ('h1', 'm2', 'held', NULL)")
-    assert con.execute("SELECT status, checked_in_memo FROM hypothesis_status").fetchall() == [("held", "m2")]

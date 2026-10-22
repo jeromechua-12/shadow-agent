@@ -46,7 +46,7 @@ SQL_CHECKS = {
     "news_after_trade_date": ("error", "a run was shown a news item created after its trade date (look-ahead)",
         """SELECT rti.run_id || ' ' || rti.item_id FROM run_text_items rti
            JOIN text_items ti ON ti.item_id = rti.item_id JOIN runs r ON r.run_id = rti.run_id
-           WHERE ti.created_at >= CAST(r.trade_date + 1 AS TIMESTAMPTZ)"""),
+           WHERE ti.created_at >= timezone('UTC', CAST(r.trade_date + 1 AS TIMESTAMP))"""),
     "evidence_date_mismatch": ("error", "a data call's as_of differs from its run's trade date",
         "SELECT e.call_id FROM evidence_calls e JOIN runs r ON r.run_id = e.run_id WHERE e.as_of <> r.trade_date"),
     "evidence_fetched_before_trade_date": ("warning", "a data call ran before the date it analyses (clock or loader bug)",
@@ -93,6 +93,30 @@ SQL_CHECKS = {
     "decision_memo_from_future": ("error", "a decision used a memo whose cycle date is after the trade date",
         """SELECT d.decision_id FROM decisions d JOIN memos m ON m.memo_id = d.memo_id
            WHERE m.cycle_date > d.trade_date OR m.experiment_version <> d.experiment_version"""),
+    "served_items_not_linked": ("warning", "a data call served news items that are not linked yet (reload after "
+                                "the news store has them)",
+        """SELECT e.call_id FROM evidence_calls e
+           WHERE len(coalesce(e.served_item_ids, [])) >
+                 (SELECT count(*) FROM run_text_items rti WHERE rti.call_id = e.call_id)"""),
+    "multiple_decision_sets": ("error", "more than one upstream run decided for the same version, ticker and date",
+        """SELECT experiment_version || ' ' || ticker || ' ' || trade_date FROM decisions
+           GROUP BY experiment_version, ticker, trade_date HAVING count(DISTINCT run_id) > 1"""),
+    "decision_run_not_current": ("warning", "a decision judged a run that is no longer its pair's current run "
+                                 "(the pair was rerun after deciding)",
+        """SELECT DISTINCT d.experiment_version || ' ' || d.run_id FROM decisions d
+           WHERE d.run_id NOT IN (SELECT run_id FROM current_runs)"""),
+    "outcome_horizon_not_10": ("error", "outcome horizon is not 10 trading days",
+        "SELECT decision_id FROM outcomes WHERE horizon_days <> 10"),
+    "first_memo_not_default_level": ("error", "an experiment version's first memo is not at risk level 3",
+        """SELECT memo_id FROM memos m WHERE risk_level <> 3 AND NOT EXISTS (
+             SELECT 1 FROM memos p WHERE p.experiment_version = m.experiment_version AND p.cycle_date < m.cycle_date)"""),
+    "hypothesis_check_invalid": ("error", "a hypothesis was checked by another version's memo or by a memo not "
+                                 "later than the one that proposed it",
+        """SELECT hc.hypothesis_id || ' ' || hc.memo_id FROM hypothesis_checks hc
+           JOIN memos m ON m.memo_id = hc.memo_id
+           JOIN memo_hypotheses h ON h.hypothesis_id = hc.hypothesis_id
+           JOIN memos pm ON pm.memo_id = h.memo_id
+           WHERE m.experiment_version <> pm.experiment_version OR m.cycle_date <= pm.cycle_date"""),
 }
 
 _ISO_DATE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
@@ -121,6 +145,17 @@ def _check_payloads(con, warehouse: Path) -> Finding:
                    "a saved data payload is missing or no longer matches its hash", len(bad), bad[:5])
 
 
+def _check_condition_inputs(con) -> Finding:
+    """Runs whose latest conditions row is missing an input (backfill with --backfill-conditions)."""
+    bad = []
+    for run_id, status in con.execute("SELECT run_id, CAST(input_status AS VARCHAR) FROM latest_conditions").fetchall():
+        missing = sorted(k for k, v in json.loads(status or "{}").items() if v != "ok")
+        if not status or missing:
+            bad.append(f"{run_id} {','.join(missing) or 'no input status'}")
+    return Finding("conditions_inputs_missing", "warning",
+                   "market conditions computed without some inputs (e.g. FRED); backfill later", len(bad), bad[:5])
+
+
 def run_checks(con: duckdb.DuckDBPyConnection, warehouse: Path | None = None) -> list[Finding]:
     findings = []
     for name, (severity, description, sql) in SQL_CHECKS.items():
@@ -128,6 +163,7 @@ def run_checks(con: duckdb.DuckDBPyConnection, warehouse: Path | None = None) ->
         findings.append(Finding(name, severity, description, len(ids), ids[:5]))
     findings.append(_check_args_after_trade_date(con))
     findings.append(_check_payloads(con, Path(warehouse or warehouse_dir())))
+    findings.append(_check_condition_inputs(con))
     return findings
 
 
@@ -142,13 +178,15 @@ def overview(con: duckdb.DuckDBPyConnection) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
-    from shadow.data.db import connect
+    from shadow.data.db import check_schema_version, connect, resolve_db
 
     parser = argparse.ArgumentParser(description="Run data quality checks.")
     parser.add_argument("--db", help="DuckDB file (default warehouse/calibration.duckdb)")
+    parser.add_argument("--dev", action="store_true", help="use warehouse/dev.duckdb")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
-    con = connect(args.db, read_only=True)
+    con = connect(resolve_db(args.db, args.dev), read_only=True)
+    check_schema_version(con, resolve_db(args.db, args.dev))
     findings = run_checks(con)
     if args.json:
         print(json.dumps({"overview": overview(con), "findings": [asdict(f) for f in findings]}, indent=1, default=str))

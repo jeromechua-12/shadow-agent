@@ -341,7 +341,9 @@ def _write_once(path: Path, text: str) -> None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex[:6]}.tmp")
-    tmp.write_text(text, encoding="utf-8")
+    # Bytes exactly as received: text mode would turn \n into \r\n on Windows
+    # and the file would no longer match its SHA-256.
+    tmp.write_bytes(text.encode("utf-8"))
     os.replace(tmp, path)
 
 
@@ -382,10 +384,10 @@ def load_payload(call: dict, root: Path | None = None) -> str | None:
     if not call.get("payload_path"):
         return None
     root = Path(root) if root is not None else warehouse_dir() / "raw"
-    text = (root / call["payload_path"]).read_text(encoding="utf-8")
-    if hashlib.sha256(text.encode("utf-8")).hexdigest() != call["output_sha256"]:
+    data = (root / call["payload_path"]).read_bytes()
+    if hashlib.sha256(data).hexdigest() != call["output_sha256"]:
         raise ValueError(f"payload hash mismatch: {call['payload_path']}")
-    return text
+    return data.decode("utf-8")
 
 
 def source_summary(calls: list[dict]) -> dict[str, dict]:

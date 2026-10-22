@@ -22,7 +22,7 @@ Usage:
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import duckdb
@@ -66,6 +66,10 @@ TRADE_COLUMNS = (
     "sentiment_confidence",
 )
 
+# A run dated D may only have seen items created before midnight UTC after D. Built
+# with timezone('UTC', ...) so the cutoff does not depend on the session's TimeZone.
+_NEWS_CUTOFF = "timezone('UTC', CAST(d.trade_date + 1 AS TIMESTAMP))"
+
 _KNOWN_TRADES = """
 SELECT d.decision_id, d.run_id, d.ticker, d.trade_date, d.verdict, d.part, d.proposed_action,
        d.direction, d.proposed_size, d.final_size, d.part_size, d.pm_rating, d.main_reason,
@@ -75,12 +79,14 @@ SELECT d.decision_id, d.run_id, d.ticker, d.trade_date, d.verdict, d.part, d.pro
        c.atr_pct, c.vix, c.rsi_14, c.sentiment_score, c.sentiment_confidence
 FROM decisions d
 JOIN outcomes o ON o.decision_id = d.decision_id
-LEFT JOIN conditions c ON c.run_id = d.run_id
+LEFT JOIN latest_conditions c ON c.run_id = d.run_id
 WHERE d.experiment_version = ? AND d.trade_date <= ? AND o.resolved_on <= ?
 """
 
 
 def _plain(v):
+    if isinstance(v, datetime) and v.tzinfo is not None:
+        return v.astimezone(timezone.utc).isoformat()  # same text whatever the session timezone
     if isinstance(v, (date, datetime)):
         return v.isoformat()
     if isinstance(v, Decimal):
@@ -176,8 +182,8 @@ def build_filters(filters: dict | None) -> tuple[str, list]:
             if not isinstance(value, str) or not value.strip():
                 raise ValueError("filter 'news_keyword' takes a non-empty string")
             sql.append("AND EXISTS (SELECT 1 FROM run_text_items rti JOIN text_items ti ON ti.item_id = rti.item_id "
-                       "WHERE rti.run_id = d.run_id AND contains(lower(coalesce(ti.title, '') || ' ' || "
-                       "coalesce(ti.body, '')), lower(?)))")
+                       "WHERE rti.run_id = d.run_id AND ti.created_at < " + _NEWS_CUTOFF + " "
+                       "AND contains(lower(coalesce(ti.title, '') || ' ' || coalesce(ti.body, '')), lower(?)))")
             params.append(value.strip())
         elif name == "decision_ids":
             if not isinstance(value, list) or not value or not all(isinstance(v, str) for v in value):
@@ -282,14 +288,15 @@ class CalibrationTools:
         proposal = _dicts(self.con.execute(
             "SELECT action, direction, entry_price, stop_loss, position_sizing, reasoning, structured_ok "
             "FROM trader_proposals WHERE run_id = ?", [run_id]))
-        conditions = _dicts(self.con.execute("SELECT * EXCLUDE (run_id) FROM conditions WHERE run_id = ?", [run_id]))
+        conditions = _dicts(self.con.execute("SELECT * EXCLUDE (run_id, computed_at) FROM latest_conditions WHERE run_id = ?", [run_id]),
+                            json_cols=("input_status",))
         reports = {r["agent"]: r["text"][:max_chars] + ("…" if len(r["text"]) > max_chars else "")
                    for r in _dicts(self.con.execute(
                        "SELECT agent, text FROM agent_outputs WHERE run_id = ? ORDER BY agent, round", [run_id]))}
         news = _dicts(self.con.execute(
             "SELECT DISTINCT ti.item_id, ti.created_at, ti.publisher, ti.title, ti.url FROM run_text_items rti "
             "JOIN text_items ti ON ti.item_id = rti.item_id JOIN runs r ON r.run_id = rti.run_id "
-            "WHERE rti.run_id = ? AND ti.created_at < CAST(r.trade_date + 1 AS TIMESTAMPTZ) "
+            "WHERE rti.run_id = ? AND ti.created_at < timezone('UTC', CAST(r.trade_date + 1 AS TIMESTAMP)) "
             "ORDER BY ti.created_at DESC LIMIT 20", [run_id]))
         sources = _dicts(self.con.execute(
             "SELECT method, status, any_value(vendor) AS vendor, count(*) AS calls FROM evidence_calls "
@@ -340,7 +347,11 @@ class CalibrationTools:
             JOIN memos pm ON pm.memo_id = h.memo_id
             LEFT JOIN (
               SELECT hc.*, m.cycle_date FROM hypothesis_checks hc JOIN memos m ON m.memo_id = hc.memo_id
-              WHERE m.cycle_date < ?
+              JOIN memo_hypotheses h2 ON h2.hypothesis_id = hc.hypothesis_id
+              JOIN memos pm2 ON pm2.memo_id = h2.memo_id
+              -- a check counts only from the same version, a later cycle, and before as_of
+              WHERE m.cycle_date < ? AND m.experiment_version = pm2.experiment_version
+                AND m.cycle_date > pm2.cycle_date
               QUALIFY row_number() OVER (PARTITION BY hc.hypothesis_id ORDER BY m.cycle_date DESC) = 1
             ) c ON c.hypothesis_id = h.hypothesis_id
             WHERE pm.experiment_version = ? AND pm.cycle_date < ?

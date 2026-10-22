@@ -117,6 +117,20 @@ def test_note_items_links_served_articles(monkeypatch):
     assert rec.calls[0]["items"] == [{"source": "alpaca_news", "key": "NVDA", "ids": ["101", "102"]}]
 
 
+def test_payload_bytes_match_hash_with_newlines(tmp_path, monkeypatch):
+    """Multi-line output keeps its exact bytes on disk (no \\r\\n translation on Windows)."""
+    import hashlib
+
+    text = "Date,Close\n2026-09-01,217.2\n"
+    monkeypatch.setitem(router.VENDOR_METHODS, "get_stock_data", {"yfinance": fake(text)})
+    with run_config({"data_vendors": {"core_stock_apis": "yfinance"}}), evidence.capture() as rec:
+        route("get_stock_data", "NVDA", "2026-08-01", "2026-09-01")
+    evidence.persist(rec.calls, "run1", "NVDA", "2026-09-01", root=tmp_path)
+    (payload,) = (tmp_path / "payloads").rglob("*.txt")
+    assert payload.read_bytes() == text.encode()
+    assert hashlib.sha256(payload.read_bytes()).hexdigest() == payload.stem
+
+
 def test_persist_dedupes_payloads_and_never_overwrites(tmp_path, monkeypatch):
     monkeypatch.setitem(router.VENDOR_METHODS, "get_stock_data", {"yfinance": fake("same table")})
     with run_config({"data_vendors": {"core_stock_apis": "yfinance"}}), evidence.capture() as rec:

@@ -3,7 +3,7 @@
 from copy import deepcopy
 
 from shadow.data import alpaca_news
-from shadow.data.paths import upstream_cache_dir
+from shadow.data.paths import warehouse_dir
 from tradingagents.default_config import DEFAULT_CONFIG
 
 # Bump when anything that changes cached outputs changes (prompts, vendors,
@@ -15,6 +15,9 @@ ANALYSTS = ("market", "social", "news", "fundamentals")
 # Upstream cache runs only (the proposal allows 0 to 0.2). At 0.0 DeepSeek's
 # hidden reasoning looped until the token cap and returned empty reports.
 UPSTREAM_TEMPERATURE = 0.2
+# One retry at this temperature when an agent still loops to the token cap
+# and returns nothing; the run records the temperature it used.
+RETRY_TEMPERATURE = 0.6
 
 TOOL_VENDORS = {
     **alpaca_news.CONFIG_OVERRIDES["tool_vendors"],
@@ -35,8 +38,9 @@ def shadow_config(temperature: float = UPSTREAM_TEMPERATURE) -> dict:
     config["checkpoint_enabled"] = False
     # Upstream outputs must depend only on (ticker, date): no memory log.
     config["memory_log_path"] = None
-    # TradingAgentsGraph creates results_dir; keep it out of ~/.tradingagents.
-    config["results_dir"] = str(upstream_cache_dir() / "_tradingagents_results")
+    # TradingAgentsGraph creates results_dir (nothing is written there by the
+    # cache runner); keep it out of ~/.tradingagents and out of the cache folders.
+    config["results_dir"] = str(warehouse_dir() / "_tradingagents_results")
     return config
 
 

@@ -25,5 +25,10 @@ def warehouse_dir() -> Path:
 
 
 def upstream_cache_dir() -> Path:
-    """Root of the cached upstream (analysts → Trader) outputs."""
+    """Root of the cached upstream (analysts → Trader) outputs: the real experiment cache."""
     return Path(os.environ.get("SHADOW_UPSTREAM_CACHE_DIR") or REPO_ROOT / "upstream_cache")
+
+
+def sample_cache_dir() -> Path:
+    """Upstream runs made for testing (e.g. the 2 x 5 sample); the dev database loads these."""
+    return Path(os.environ.get("SHADOW_SAMPLE_CACHE_DIR") or warehouse_dir() / "sample_upstream_cache")

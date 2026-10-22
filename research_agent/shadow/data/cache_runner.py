@@ -36,10 +36,11 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langgraph.checkpoint.memory import InMemorySaver
 
 from shadow.data import alpaca_news, evidence
-from shadow.data.paths import REPO_ROOT, upstream_cache_dir, warehouse_dir
+from shadow.data.paths import REPO_ROOT, sample_cache_dir, upstream_cache_dir, warehouse_dir
 from shadow.data.settings import (
     ANALYSTS,
     CACHE_VERSION,
+    RETRY_TEMPERATURE,
     UPSTREAM_TEMPERATURE,
     model_settings,
     shadow_config,
@@ -124,9 +125,13 @@ def _is_rate_limit(exc: BaseException) -> bool:
     return "RateLimit" in text or "429" in text
 
 
-def _incomplete_reasons(outputs: dict, calls: list[dict]) -> list[str]:
+def _incomplete_reasons(outputs: dict, calls: list[dict], structured: dict | None = None) -> list[str]:
     reasons = [f"empty {k}" for k in (*REPORT_KEYS, "investment_plan", "trader_investment_plan")
                if not (outputs.get(k) or "").strip()]
+    # The books and the decision logger need the proposal as numbers; a free-text
+    # fallback has none, and they are never parsed back out of prose.
+    if structured is not None and not structured.get("trader_proposal"):
+        reasons.append("trader proposal not structured (free-text fallback)")
     # Each debate turn is stored as "<Speaker>: <reply>"; a blank reply leaves only the label.
     for side in ("bull_history", "bear_history"):
         text = outputs["investment_debate"].get(side) or ""
@@ -201,7 +206,7 @@ def run_upstream(ticker: str, trade_date: str, temperature: float = UPSTREAM_TEM
         "trader_investment_plan": state.get("trader_investment_plan", ""),
     }
     calls = rec.calls
-    reasons = _incomplete_reasons(outputs, calls)
+    reasons = _incomplete_reasons(outputs, calls, rec.structured)
     return {
         "cache_version": CACHE_VERSION,
         "run_id": run_id,
@@ -259,13 +264,14 @@ class RateGate:
             time.sleep(min(left, 5))
 
 
-def run_with_retries(ticker: str, trade_date: str, gate: RateGate | None = None) -> dict:
+def run_with_retries(ticker: str, trade_date: str, gate: RateGate | None = None,
+                     temperature: float = UPSTREAM_TEMPERATURE) -> dict:
     gate = gate or RateGate()
     delay = RATE_LIMIT_BASE_DELAY_S
     for attempt in range(RATE_LIMIT_RETRIES + 1):
         gate.wait()
         try:
-            return run_upstream(ticker, trade_date)
+            return run_upstream(ticker, trade_date, temperature)
         except Exception as e:
             if not _is_rate_limit(e) or attempt == RATE_LIMIT_RETRIES:
                 raise
@@ -299,6 +305,34 @@ def spend_since(before: float | None, settle_s: int = 30) -> float | None:
     return None if after is None else round(after - before, 6)
 
 
+def empty_at_token_cap(record: dict) -> list[str]:
+    """Nodes whose reply was cut off by the token cap with no text and no tool call."""
+    return sorted({c["node"] for c in record.get("llm_calls") or []
+                   if c.get("finish_reason") == "length" and not c.get("content_chars") and not c.get("tool_calls")})
+
+
+def _run_once_or_retry_hotter(ticker: str, trade_date: str, gate: RateGate, previous: dict | None) -> dict:
+    """Run at the pinned temperature; if an agent looped to the token cap, run once more hotter.
+
+    A pair whose previous cached run already looped starts at the retry
+    temperature. The looping attempt is kept under _superseded/.
+    """
+    start = RETRY_TEMPERATURE if previous is not None and empty_at_token_cap(previous) else UPSTREAM_TEMPERATURE
+    record = run_with_retries(ticker, trade_date, gate, start)
+    looped = empty_at_token_cap(record)
+    if record["complete"] or not looped or start == RETRY_TEMPERATURE:
+        return record
+    print(f"retrying {ticker} {trade_date} at temperature {RETRY_TEMPERATURE}: "
+          f"{', '.join(looped)} returned nothing at the token cap", flush=True)
+    path = cache_path(ticker, trade_date)
+    _write_atomic(path.parent / "_superseded" / f"{trade_date}.{record['run_id']}.json", record)
+    retry = run_with_retries(ticker, trade_date, gate, RETRY_TEMPERATURE)
+    retry["retry_of"] = {"run_id": record["run_id"], "temperature": start,
+                         "reason": f"empty reply at token cap: {', '.join(looped)}",
+                         "cost_usd": record["usage"].get("cost_usd")}
+    return retry
+
+
 def _run_and_save(ticker: str, trade_date: str, gate: RateGate, ticker_lock: threading.Lock) -> bool:
     """Run one pair and write its cache file (or a _failed record). True on success."""
     path = cache_path(ticker, trade_date)
@@ -306,7 +340,7 @@ def _run_and_save(ticker: str, trade_date: str, gate: RateGate, ticker_lock: thr
     # news cache files.
     with ticker_lock:
         try:
-            record = run_with_retries(ticker, trade_date, gate)
+            record = _run_once_or_retry_hotter(ticker, trade_date, gate, read_cache(ticker, trade_date))
         except Exception as e:
             logger.exception("Run failed for %s %s", ticker, trade_date)
             _write_atomic(path.parent / "_failed" / f"{trade_date}.{uuid.uuid4().hex[:12]}.json", {
@@ -320,20 +354,29 @@ def _run_and_save(ticker: str, trade_date: str, gate: RateGate, ticker_lock: thr
             _supersede(path, old)
         _write_atomic(path, record)
     state = "complete" if record["complete"] else "INCOMPLETE"
-    lines = [f"saved {path} ({state}, {record['duration_s']}s, {record['usage']})"]
+    lines = [f"saved {path} ({state}, temperature {record['model']['temperature']}, "
+             f"{record['duration_s']}s, {record['usage']})"]
     lines += [f"  - {reason}" for reason in record["incomplete_reasons"]]
     print("\n".join(lines), flush=True)
     return True
 
 
-def plan(tickers: list[str], dates: list[str], rerun_incomplete: bool) -> list[tuple[str, str, str]]:
-    """(ticker, date, why) for every pair that needs a run."""
+def plan(tickers: list[str], dates: list[str], rerun_incomplete: bool,
+         rerun: bool = False) -> list[tuple[str, str, str]]:
+    """(ticker, date, why) for every pair that needs a run, tickers interleaved.
+
+    Runs of one ticker never overlap, so alternating tickers lets parallel
+    workers start different tickers instead of queueing behind one. ``rerun``
+    reruns the named pairs even if cached (the old file is kept as superseded).
+    """
     todo = []
-    for t in tickers:
-        for d in dates:
+    for d in dates:
+        for t in tickers:
             cached = read_cache(t, d)
             if cached is None:
                 todo.append((t, d, "not cached"))
+            elif rerun:
+                todo.append((t, d, f"rerun requested (replaces run {cached.get('run_id')})"))
             elif rerun_incomplete and not cached.get("complete"):
                 todo.append((t, d, "incomplete: " + "; ".join(cached.get("incomplete_reasons", []))))
     return todo
@@ -349,12 +392,20 @@ def main(argv: list[str] | None = None) -> int:
                         help="refuse to start more LLM runs than this (default 1)")
     parser.add_argument("--workers", type=int, default=1,
                         help="pairs run in parallel (default 1; keep small for OpenRouter limits)")
+    parser.add_argument("--rerun", action="store_true",
+                        help="rerun the named pairs even if cached (old files kept as superseded)")
+    parser.add_argument("--sample", action="store_true",
+                        help="write to the sample cache (warehouse/sample_upstream_cache), not the real one")
     parser.add_argument("--dry-run", action="store_true", help="only list what would run")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    if args.sample:
+        # cache_path() reads this on every call, so the whole batch goes to the sample folder.
+        os.environ["SHADOW_UPSTREAM_CACHE_DIR"] = str(sample_cache_dir())
+    print(f"cache: {upstream_cache_dir()}")
 
     tickers = [t.upper() for t in args.tickers]
-    todo = plan(tickers, args.dates, args.rerun_incomplete)
+    todo = plan(tickers, args.dates, args.rerun_incomplete, args.rerun)
     for t, d, why in todo:
         print(f"to run: {t} {d} ({why})")
     if not todo:

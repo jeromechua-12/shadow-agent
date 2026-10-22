@@ -58,7 +58,7 @@ def build(con) -> None:
          "stop_loss": 95.0, "position_sizing": "full", "reasoning": "fake", "structured_ok": True}
         for r, (t, d, _) in RUNS.items()])
     append_rows(con, "conditions", [
-        {"run_id": r, "as_of": d, "vix": vix, "atr_pct": 0.02, "sentiment_score": 6.0,
+        {"run_id": r, "computed_at": "2026-10-22T10:00:00+00:00", "as_of": d, "input_status": {"prices": "ok", "vix": "ok", "yield_curve": "ok"}, "vix": vix, "atr_pct": 0.02, "sentiment_score": 6.0,
          "sentiment_confidence": "medium", "missing_sources": []} for r, (t, d, vix) in RUNS.items()])
     append_rows(con, "agent_outputs", [
         {"run_id": r, "agent": "news", "round": 1, "text": f"news report for {t} on {d} " + "x" * 3000}

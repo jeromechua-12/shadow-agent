@@ -84,7 +84,8 @@ CREATE TABLE IF NOT EXISTS evidence_calls (
   seconds        DOUBLE,
   output_chars   INTEGER,
   payload_path   VARCHAR,                 -- warehouse/raw/payloads/<sha[:2]>/<sha>.txt
-  payload_sha256 VARCHAR
+  payload_sha256 VARCHAR,
+  served_item_ids VARCHAR[]               -- text_items ids the call showed, in order (links may lag)
 );
 
 -- Headlines and posts, stored once however many runs saw them.
@@ -141,10 +142,13 @@ CREATE TABLE IF NOT EXISTS trader_proposals (
   structured_ok   BOOLEAN NOT NULL  -- false: Trader fell back to free text, fields are NULL
 );
 
--- Market numbers at decision time, computed by plain code (no LLM).
+-- Market numbers at decision time, computed by plain code (no LLM). Append-only: a
+-- backfill (e.g. once FRED is configured) adds a newer row; use latest_conditions.
 CREATE TABLE IF NOT EXISTS conditions (
-  run_id               VARCHAR PRIMARY KEY REFERENCES runs(run_id),
+  run_id               VARCHAR NOT NULL REFERENCES runs(run_id),
+  computed_at          TIMESTAMPTZ NOT NULL,
   as_of                DATE NOT NULL,
+  input_status         JSON,     -- {"prices": "ok", "vix": "not_configured", ...}
   close                DOUBLE,
   atr_pct              DOUBLE,   -- 14-day ATR / close
   volatility_20d       DOUBLE,   -- stdev of daily returns, annualised
@@ -156,7 +160,24 @@ CREATE TABLE IF NOT EXISTS conditions (
   sentiment_band       VARCHAR,
   sentiment_confidence VARCHAR,
   news_items_seen      INTEGER,
-  missing_sources      VARCHAR[] -- methods with no usable data (status <> 'ok')
+  missing_sources      VARCHAR[], -- methods with no usable data (status <> 'ok')
+  PRIMARY KEY (run_id, computed_at)
+);
+
+-- What each conditions row was computed from (evidence for the numbers above).
+CREATE TABLE IF NOT EXISTS condition_inputs (
+  run_id         VARCHAR NOT NULL REFERENCES runs(run_id),
+  computed_at    TIMESTAMPTZ NOT NULL,
+  input          VARCHAR NOT NULL,     -- prices | vix | yield_curve
+  source         VARCHAR,              -- yfinance | fred
+  series         VARCHAR,              -- ticker, VIXCLS, T10Y2Y
+  status         VARCHAR NOT NULL CHECK (status IN
+                   ('ok','no_data','unavailable','withheld','blocked','not_configured','error')),
+  detail         VARCHAR,
+  fetched_at     TIMESTAMPTZ NOT NULL,
+  payload_path   VARCHAR,
+  payload_sha256 VARCHAR,
+  PRIMARY KEY (run_id, computed_at, input)
 );
 
 -- ---------------------------------------------------------------------------
@@ -279,10 +300,10 @@ SELECT * FROM runs
 WHERE complete
 QUALIFY row_number() OVER (PARTITION BY ticker, trade_date ORDER BY started_at DESC) = 1;
 
-CREATE OR REPLACE VIEW hypothesis_status AS
-SELECT h.*, c.status, c.memo_id AS checked_in_memo, c.evidence
-FROM memo_hypotheses h
-LEFT JOIN (
-  SELECT hc.*, m.cycle_date FROM hypothesis_checks hc JOIN memos m USING (memo_id)
-  QUALIFY row_number() OVER (PARTITION BY hypothesis_id ORDER BY m.cycle_date DESC) = 1
-) c USING (hypothesis_id);
+CREATE OR REPLACE VIEW latest_conditions AS
+SELECT * FROM conditions
+QUALIFY row_number() OVER (PARTITION BY run_id ORDER BY computed_at DESC) = 1;
+
+-- A hypothesis's status depends on the calibration date, so there is no view for it:
+-- use queries.CalibrationTools.past_memos(), which applies the as-of rule.
+DROP VIEW IF EXISTS hypothesis_status;

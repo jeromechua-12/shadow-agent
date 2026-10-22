@@ -76,7 +76,10 @@ def setup(tmp_path):
 
 
 def market(ticker, day):
-    return {"close": 217.2, "atr_pct": 0.031, "rsi_14": 55.0, "vix": 16.34, "yield_curve": 0.4}
+    inputs = [{"input": i, "source": s, "series": x, "status": "ok", "payload": f"{x} data"}
+              for i, s, x in (("prices", "yfinance", ticker), ("vix", "fred", "VIXCLS"), ("yield_curve", "fred", "T10Y2Y"))]
+    return {"values": {"close": 217.2, "atr_pct": 0.031, "rsi_14": 55.0, "vix": 16.34, "yield_curve": 0.4},
+            "inputs": inputs}
 
 
 def load(con, warehouse, cache):
@@ -86,8 +89,8 @@ def load(con, warehouse, cache):
 
 def test_loads_every_table_and_is_idempotent(setup):
     con, warehouse, cache = setup
-    assert load(con, warehouse, cache) == {"news_items_added": 2, "runs_loaded": 1, "runs_already_loaded": 0, "failed": []}
-    assert load(con, warehouse, cache) == {"news_items_added": 0, "runs_loaded": 0, "runs_already_loaded": 1, "failed": []}
+    assert load(con, warehouse, cache) == {"news_items_added": 2, "runs_loaded": 1, "runs_already_loaded": 0, "links_added": 2, "failed": []}
+    assert load(con, warehouse, cache) == {"news_items_added": 0, "runs_loaded": 0, "runs_already_loaded": 1, "links_added": 0, "failed": []}
 
     q = lambda sql: con.execute(sql).fetchall()  # noqa: E731
     assert q("SELECT run_id, temperature, cost_usd FROM runs") == [("run_a", 0.2, 0.0172)]
@@ -101,7 +104,7 @@ def test_loads_every_table_and_is_idempotent(setup):
     assert q("SELECT item_id, rank FROM run_text_items ORDER BY rank") == [("alpaca_news:1", 1), ("alpaca_news:2", 2)]
     assert q("SELECT count(*) FROM agent_outputs") == [(8,)]
     cond = con.execute("SELECT vix, atr_pct, sentiment_score, sentiment_confidence, news_items_seen, "
-                       "missing_sources FROM conditions").fetchone()
+                       "missing_sources FROM latest_conditions").fetchone()
     assert cond == (16.34, 0.031, 6.5, "low", 2, ["fetch_stocktwits_messages", "get_macro_indicators"])
 
 

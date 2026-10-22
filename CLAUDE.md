@@ -102,6 +102,10 @@ Changes for this project:
   - Polymarket and valuation metrics: withheld for past dates on purpose (look-ahead guard)
   - FRED macro indicators: work (vintage pinned to the analysis date)
 - Financial statements use tool_vendors "sec_edgar,yfinance" (EDGAR by filing date first).
+- Upstream runs use temperature 0.2, with one retry at 0.6 when an agent loops to the token cap.
+- Test runs live in warehouse/sample_upstream_cache/ and load only into warehouse/dev.duckdb.
+  The real cache (upstream_cache/) and main DB (warehouse/calibration.duckdb) start empty.
+  Known gap in the sample: NVDA 2026-09-08 (Fundamentals Analyst loops at 0.2 and 0.6).
 - News source for past dates: Alpaca news API (historical Benzinga news, free account, tested OK).
   GET https://data.alpaca.markets/v1beta1/news with params symbols, start, end, limit (max 50),
   page_token; headers APCA-API-KEY-ID and APCA-API-SECRET-KEY. Use created_at (not updated_at)
