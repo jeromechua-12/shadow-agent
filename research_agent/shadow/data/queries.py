@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import math
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -124,8 +125,58 @@ def beta_stats(successes: int, failures: int, prior: tuple[float, float] = (1.0,
     }
 
 
+CUSUM_K = 0.5   # standardised shift (in std units) treated as noise, not drift
+CUSUM_H = 4.0   # standardised decision threshold: |S| beyond this flags a trend
+
+
+def cusum_trend(rows: list[dict], target: float | None = None, k: float = CUSUM_K, h: float = CUSUM_H) -> dict:
+    """Two-sided CUSUM over the success/failure sequence (noise excluded), ordered by
+    when each outcome was resolved: evidence of a category's success rate drifting
+    over time, not just its overall level.
+
+    Each resolved trade is a Bernoulli draw (1 = success, 0 = failure) standardised
+    against ``target`` (the sequence's own success rate when not given, so the test
+    is self-referential: "did the rate move away from its own average"). ``S+``
+    accumulates evidence of a rate above target, ``S-`` below; a move smaller than
+    ``k`` standard deviations is treated as noise, and crossing ``+-h`` flags the
+    direction and the trade at which it first crossed. Mirrors ``thin_evidence`` at
+    n < 10 scored trades, same as ``group_stats``.
+    """
+    scored = sorted((r for r in rows if r["label"] in SUCCESS or r["label"] in FAILURE),
+                    key=lambda r: (r["resolved_on"], r["decision_id"]))
+    n = len(scored)
+    if target is None:
+        target = (sum(r["label"] in SUCCESS for r in scored) / n) if n else 0.5
+    sigma = math.sqrt(target * (1 - target)) if 0 < target < 1 else None
+    s_pos = s_neg = 0.0
+    flagged_at = None
+    trace = []
+    for r in scored:
+        z = ((1.0 if r["label"] in SUCCESS else 0.0) - target) / sigma if sigma else 0.0
+        s_pos = max(0.0, s_pos + z - k)
+        s_neg = min(0.0, s_neg + z + k)
+        trace.append({"decision_id": r["decision_id"], "resolved_on": r["resolved_on"],
+                      "s_pos": round(s_pos, 4), "s_neg": round(s_neg, 4)})
+        if flagged_at is None and (s_pos > h or s_neg < -h):
+            flagged_at = {"decision_id": r["decision_id"], "resolved_on": r["resolved_on"],
+                          "direction": "up" if s_pos > h else "down"}
+    return {
+        "n": n,
+        "target": round(target, 4),
+        "k": k,
+        "h": h,
+        "flagged": flagged_at is not None,
+        "direction": flagged_at["direction"] if flagged_at else None,
+        "flagged_at": flagged_at,
+        "final_s_pos": round(s_pos, 4),
+        "final_s_neg": round(s_neg, 4),
+        "thin_evidence": n < 10,
+        "trace": trace,
+    }
+
+
 def group_stats(rows: list[dict], max_ids: int = 50) -> dict:
-    """Counts, success rate (noise excluded), Beta-Binomial posterior, mean scores by part."""
+    """Counts, success rate (noise excluded), Beta-Binomial posterior, CUSUM trend, mean scores by part."""
     labels = dict.fromkeys(sorted(LABELS), 0)
     for r in rows:
         labels[r["label"]] += 1
@@ -143,6 +194,7 @@ def group_stats(rows: list[dict], max_ids: int = 50) -> dict:
         "successes": s,
         "success_rate": round(s / (s + f), 4) if s + f else None,
         "beta": beta_stats(s, f),
+        "trend": cusum_trend(rows),
         "mean_score_approved_parts": mean_score("approved_part"),
         "mean_score_rejected_parts": mean_score("rejected_part"),
         "thin_evidence": (s + f) < 10,
