@@ -87,7 +87,7 @@ Changes for this project:
 
 ## Environment and data status (as of 2026-10-22)
 
-- Working branch: `yt`. Windows, PowerShell, venv at research_agent/.venv.
+- Working branch: `data-layer`. Windows, PowerShell, venv at research_agent/.venv.
 - research_agent/.env holds OPENROUTER_API_KEY, ALPACA_API_KEY_ID, ALPACA_API_SECRET_KEY,
   SEC_EDGAR_USER_AGENT and FRED_API_KEY (FRED available since 2026-10-22). Code must still run
   without a key, record the source as not_configured, and allow rerunning with --rerun-incomplete.
