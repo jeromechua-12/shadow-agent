@@ -221,3 +221,8 @@ __marimo__/
 
 # DS_Store
 .DS_Store
+
+# shadow-agent data (never commit)
+upstream_cache/
+warehouse/
+*.duckdb
