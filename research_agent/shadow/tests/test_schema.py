@@ -9,7 +9,7 @@ TABLES = {
     "schema_info", "runs", "llm_calls", "evidence_calls", "text_items", "run_text_items",
     "agent_outputs", "trader_proposals", "conditions", "decisions", "outcomes",
     "book_snapshots", "memos", "memo_advice", "memo_hypotheses", "hypothesis_checks",
-    "memo_tool_calls", "condition_inputs",
+    "memo_tool_calls", "calibration_attempts", "calibration_attempt_tool_calls", "condition_inputs",
 }
 
 
@@ -32,7 +32,23 @@ def test_creates_all_tables_and_is_idempotent(tmp_path):
     names = {r[0] for r in con.execute("SELECT table_name FROM information_schema.tables "
                                        "WHERE table_type = 'BASE TABLE'").fetchall()}
     assert names == TABLES
-    assert con.execute("SELECT value FROM schema_info WHERE key = 'schema_version'").fetchall() == [("2",)]
+    assert con.execute("SELECT value FROM schema_info WHERE key = 'schema_version'").fetchall() == [("3",)]
+
+
+def test_v2_migration_preserves_existing_memo_rows(tmp_path):
+    path = tmp_path / "v2.duckdb"
+    con = init_db(path)
+    con.execute("INSERT INTO memos (memo_id, experiment_version, cycle_date, created_at, risk_level, "
+                "memo_text, safety_passed) VALUES ('existing', 'v', '2026-08-31', now(), 3, 'keep', true)")
+    con.execute("UPDATE schema_info SET value = '2' WHERE key = 'schema_version'")
+    con.close()
+
+    upgraded = init_db(path)
+    assert upgraded.execute("SELECT memo_id, memo_text FROM memos").fetchall() == [("existing", "keep")]
+    assert upgraded.execute("SELECT value FROM schema_info WHERE key = 'schema_version'").fetchone() == ("3",)
+    assert upgraded.execute("SELECT count(*) FROM information_schema.tables "
+                            "WHERE table_name = 'calibration_attempts'").fetchone() == (1,)
+    upgraded.close()
 
 
 def test_status_check_rejects_unknown_status(con):

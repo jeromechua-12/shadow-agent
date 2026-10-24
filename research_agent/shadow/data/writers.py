@@ -12,6 +12,7 @@ added (see the README for why).
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import date, datetime, timezone
 
@@ -262,15 +263,71 @@ def insert_book_snapshot(
 
 # ---- memos -------------------------------------------------------------------------
 
+def insert_calibration_attempts(
+    con: duckdb.DuckDBPyConnection, *, experiment_version: str, cycle_date,
+    calibration_run_id: str, attempts: list[dict],
+) -> int:
+    """Append every model attempt and its individual tool trace before memo selection."""
+    problems: list[str] = []
+    cycle = _as_date(cycle_date, "cycle_date", problems)
+    if not experiment_version:
+        problems.append("experiment_version is required")
+    if not calibration_run_id:
+        problems.append("calibration_run_id is required")
+    if len(attempts) != 3:
+        problems.append(f"exactly three attempts are required, got {len(attempts)}")
+    attempt_nos = [a.get("attempt_no") for a in attempts]
+    if sorted(attempt_nos) != [1, 2, 3]:
+        problems.append("attempt_no values must be exactly 1, 2 and 3")
+    for i, attempt in enumerate(attempts):
+        if not attempt.get("attempt_id") or not attempt.get("model") or not attempt.get("status"):
+            problems.append(f"attempts[{i}] needs attempt_id, model and status")
+        if not isinstance(attempt.get("safety_passed"), bool):
+            problems.append(f"attempts[{i}].safety_passed must be boolean")
+    if problems:
+        raise InvalidRecord("calibration attempts", problems)
+
+    rows, calls = [], []
+    for attempt in attempts:
+        rows.append({
+            "attempt_id": attempt["attempt_id"], "calibration_run_id": calibration_run_id,
+            "experiment_version": experiment_version, "cycle_date": cycle,
+            "attempt_no": attempt["attempt_no"], "created_at": attempt.get("created_at") or _now(),
+            "model": attempt["model"], "status": attempt["status"],
+            "proposed_risk_level": attempt.get("proposed_risk_level"),
+            "accepted_risk_level": attempt.get("accepted_risk_level"),
+            "output": attempt.get("output") or {}, "error": attempt.get("error"),
+            "safety_passed": attempt["safety_passed"],
+            "safety_blockers": json.dumps(attempt.get("safety_blockers") or []),
+            "safety_flags": json.dumps(attempt.get("safety_flags") or []),
+            "evidence_score": attempt.get("evidence_score") or [0, 0, 0],
+        })
+        for call in attempt.get("tool_calls") or []:
+            calls.append({"attempt_id": attempt["attempt_id"], "seq": call["seq"],
+                          "tool": call["tool"], "args": call.get("args") or {},
+                          "result": call.get("result"), "called_at": call.get("called_at") or _now()})
+    con.begin()
+    try:
+        append_rows(con, "calibration_attempts", rows)
+        append_rows(con, "calibration_attempt_tool_calls", calls)
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    return len(rows)
+
 def insert_memo(
     con: duckdb.DuckDBPyConnection, *, experiment_version: str, cycle_date, risk_level: int, memo_text: str,
-    advice: dict, safety_passed: bool, safety_flags: dict | None = None, model: str | None = None,
+    advice: dict, safety_passed: bool, risk_level_rationale: str | None = None,
+    safety_flags: dict | None = None, model: str | None = None,
     hypotheses: list | None = None, hypothesis_checks: list | None = None, tool_calls: list | None = None,
 ) -> dict:
     """Record a Calibration Agent memo and everything behind it, in one transaction.
 
     advice:            {category: {"advice": tighten|loosen|keep, "confidence": low|medium|high,
-                                   "reasoning": str, "cited_ids": [str, ...]}}  (all five categories)
+                                   "reasoning": str, "cited_ids": [str, ...],
+                                   "conditions": [...], "supporting_ids": [...],
+                                   "contradicting_ids": [...], "watch_next": [...]}} (all five)
     hypotheses:        [{"statement": str, "category": str|None, "subgroup": {filters given to subgroup_stats}}]
     hypothesis_checks: [{"hypothesis_id": str, "status": pending|held|failed, "evidence": {...}}]
     tool_calls:        [{"tool": str, "args": {...}, "result": {...}, "called_at": iso timestamp}]
@@ -287,6 +344,8 @@ def insert_memo(
         problems.append(f"risk_level must be an integer 1-5, got {risk_level!r}")
     if not isinstance(memo_text, str) or not memo_text.strip():
         problems.append("memo_text is required (it goes into the risk team's prompts)")
+    if risk_level_rationale is not None and not str(risk_level_rationale).strip():
+        problems.append("risk_level_rationale must be non-empty when provided")
     advice = advice if isinstance(advice, dict) else {}
     if set(advice) != set(CATEGORIES):
         problems.append(f"advice needs exactly these categories: {list(CATEGORIES)}; got {sorted(advice)}")
@@ -355,11 +414,17 @@ def insert_memo(
     try:
         append_rows(con, "memos", [{"memo_id": memo_id, "experiment_version": experiment_version, "cycle_date": cycle,
                                     "created_at": _now(), "risk_level": risk_level,
-                                    "previous_risk_level": previous_level, "memo_text": memo_text, "model": model,
+                                    "previous_risk_level": previous_level,
+                                    "risk_level_rationale": risk_level_rationale,
+                                    "memo_text": memo_text, "model": model,
                                     "safety_passed": bool(safety_passed), "safety_flags": safety_flags or {}}])
         append_rows(con, "memo_advice", [{"memo_id": memo_id, "category": cat, "advice": a["advice"],
                                           "confidence": a["confidence"], "reasoning": a["reasoning"],
-                                          "cited_ids": [str(x) for x in a.get("cited_ids") or []]}
+                                          "cited_ids": [str(x) for x in a.get("cited_ids") or []],
+                                          "conditions": json.dumps(a.get("conditions") or []),
+                                          "supporting_ids": [str(x) for x in a.get("supporting_ids") or []],
+                                          "contradicting_ids": [str(x) for x in a.get("contradicting_ids") or []],
+                                          "watch_next": json.dumps(a.get("watch_next") or [])}
                                          for cat, a in advice.items()])
         append_rows(con, "memo_hypotheses", hyp_rows)
         append_rows(con, "hypothesis_checks", [{"hypothesis_id": c["hypothesis_id"], "memo_id": memo_id,
