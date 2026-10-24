@@ -208,6 +208,17 @@ def get_portfolio_context_from_state(state: Mapping[str, Any]) -> str:
     )
 
 
+def get_risk_memo_from_state(state: Mapping[str, Any]) -> str:
+    """Return the current memo as a prompt block, or "" when there is none.
+
+    Empty must add nothing, so a no-memo prompt stays identical to the original.
+    """
+    memo = state.get("risk_memo")
+    if isinstance(memo, str) and memo.strip():
+        return f"Current risk memo (Calibration Agent feedback from past trade outcomes):\n{memo.strip()}\n"
+    return ""
+
+
 def create_msg_delete():
     def delete_messages(state):
         """Clear messages and add a context-anchored placeholder.
