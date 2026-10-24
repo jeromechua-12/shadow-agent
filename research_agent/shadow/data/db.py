@@ -9,7 +9,7 @@ import duckdb
 from shadow.data.paths import warehouse_dir
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 
 MAIN_DB_NAME = "calibration.duckdb"
@@ -52,18 +52,33 @@ def check_schema_version(con: duckdb.DuckDBPyConnection, path=None, allow_empty:
         return
     if found is None or found[0] != SCHEMA_VERSION:
         raise RuntimeError(f"{path or default_db_path()} has schema version {found[0] if found else 'unknown'}, "
-                           f"this code needs {SCHEMA_VERSION}. Rebuild it from the cache: delete the file and run "
-                           f"python -m shadow.data.loader (add --dev for the dev database).")
+                           f"this code needs {SCHEMA_VERSION}. No rows were removed. "
+                           "Run the data loader to apply a supported additive migration.")
 
 
 def init_db(path: Path | str | None = None) -> duckdb.DuckDBPyConnection:
-    """Create every table and view if missing (idempotent) and return a connection."""
+    """Create/upgrade the schema without discarding existing evidence rows."""
     con = connect(path)
     try:
-        check_schema_version(con, path, allow_empty=True)
-    except RuntimeError:
+        has_info = con.execute(
+            "SELECT count(*) FROM information_schema.tables WHERE table_name = 'schema_info'"
+        ).fetchone()[0]
+        if has_info:
+            found = con.execute("SELECT value FROM schema_info WHERE key = 'schema_version'").fetchone()
+            version = found[0] if found else None
+            if version == "2":
+                # Add only nullable/new fields and tables; preserve every existing row.
+                con.execute("ALTER TABLE memos ADD COLUMN IF NOT EXISTS risk_level_rationale VARCHAR")
+                con.execute("ALTER TABLE memo_advice ADD COLUMN IF NOT EXISTS conditions JSON")
+                con.execute("ALTER TABLE memo_advice ADD COLUMN IF NOT EXISTS supporting_ids VARCHAR[]")
+                con.execute("ALTER TABLE memo_advice ADD COLUMN IF NOT EXISTS contradicting_ids VARCHAR[]")
+                con.execute("ALTER TABLE memo_advice ADD COLUMN IF NOT EXISTS watch_next JSON")
+            elif version not in (None, SCHEMA_VERSION):
+                raise RuntimeError(f"{path or default_db_path()} has schema version {version}; "
+                                   f"this code needs {SCHEMA_VERSION}. No rows were removed.")
+        con.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
+        con.execute("INSERT OR REPLACE INTO schema_info VALUES ('schema_version', ?)", [SCHEMA_VERSION])
+        return con
+    except Exception:
         con.close()
         raise
-    con.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
-    con.execute("INSERT OR IGNORE INTO schema_info VALUES ('schema_version', ?)", [SCHEMA_VERSION])
-    return con

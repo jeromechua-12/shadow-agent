@@ -383,13 +383,15 @@ class CalibrationTools:
         """The latest memos before ``as_of`` with their advice, and every hypothesis's status as of now."""
         limit = max(1, min(int(limit), 12))
         memos = _dicts(self.con.execute(
-            "SELECT memo_id, cycle_date, risk_level, previous_risk_level, memo_text, safety_passed, safety_flags "
+            "SELECT memo_id, cycle_date, risk_level, previous_risk_level, risk_level_rationale, memo_text, "
+            "safety_passed, safety_flags "
             "FROM memos WHERE experiment_version = ? AND cycle_date < ? ORDER BY cycle_date DESC LIMIT ?",
             [self.version, self.as_of, limit]), json_cols=("safety_flags",))
         for m in memos:
             m["advice"] = _dicts(self.con.execute(
-                "SELECT category, advice, confidence, reasoning, cited_ids FROM memo_advice WHERE memo_id = ? "
-                "ORDER BY category", [m["memo_id"]]))
+                "SELECT category, advice, confidence, reasoning, cited_ids, conditions, supporting_ids, "
+                "contradicting_ids, watch_next FROM memo_advice WHERE memo_id = ? ORDER BY category",
+                [m["memo_id"]]), json_cols=("conditions", "watch_next"))
         hypotheses = _dicts(self.con.execute(
             """
             SELECT h.hypothesis_id, h.memo_id AS proposed_in, pm.cycle_date AS proposed_on, h.category,

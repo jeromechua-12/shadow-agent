@@ -244,6 +244,7 @@ CREATE TABLE IF NOT EXISTS memos (
   created_at          TIMESTAMPTZ NOT NULL,
   risk_level          INTEGER NOT NULL CHECK (risk_level BETWEEN 1 AND 5),
   previous_risk_level INTEGER CHECK (previous_risk_level BETWEEN 1 AND 5),
+  risk_level_rationale VARCHAR,
   memo_text           VARCHAR NOT NULL,  -- what goes into the risk team's prompts
   model               VARCHAR,
   safety_passed       BOOLEAN NOT NULL,
@@ -259,6 +260,10 @@ CREATE TABLE IF NOT EXISTS memo_advice (
   confidence VARCHAR NOT NULL CHECK (confidence IN ('low','medium','high')),
   reasoning  VARCHAR NOT NULL,
   cited_ids  VARCHAR[],                  -- decision_ids / run_ids / item_ids it relied on
+  conditions JSON,
+  supporting_ids VARCHAR[],
+  contradicting_ids VARCHAR[],
+  watch_next JSON,
   PRIMARY KEY (memo_id, category)
 );
 
@@ -289,6 +294,37 @@ CREATE TABLE IF NOT EXISTS memo_tool_calls (
   result    JSON,
   called_at TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (memo_id, seq)
+);
+
+-- Each independent model attempt is retained, including invalid and failed attempts.
+CREATE TABLE IF NOT EXISTS calibration_attempts (
+  attempt_id          VARCHAR PRIMARY KEY,
+  calibration_run_id  VARCHAR NOT NULL,
+  experiment_version  VARCHAR NOT NULL,
+  cycle_date          DATE NOT NULL,
+  attempt_no          INTEGER NOT NULL,
+  created_at          TIMESTAMPTZ NOT NULL,
+  model               VARCHAR NOT NULL,
+  status              VARCHAR NOT NULL,
+  proposed_risk_level INTEGER,
+  accepted_risk_level INTEGER,
+  output              JSON,
+  error               VARCHAR,
+  safety_passed       BOOLEAN NOT NULL,
+  safety_blockers     JSON,
+  safety_flags        JSON,
+  evidence_score      INTEGER[],
+  UNIQUE (calibration_run_id, attempt_no)
+);
+
+CREATE TABLE IF NOT EXISTS calibration_attempt_tool_calls (
+  attempt_id VARCHAR NOT NULL REFERENCES calibration_attempts(attempt_id),
+  seq        INTEGER NOT NULL,
+  tool       VARCHAR NOT NULL,
+  args       JSON NOT NULL,
+  result     JSON,
+  called_at  TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (attempt_id, seq)
 );
 
 -- ---------------------------------------------------------------------------

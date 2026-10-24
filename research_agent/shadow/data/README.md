@@ -49,8 +49,9 @@ Market conditions (ATR, RSI, VIX, yield curve…) are append-only too: a missing
 The outcome-date check needs a trading calendar; the command line builds it from SPY's
 prices. Called from Python without `calendar=`, that check reports SKIP rather than OK.
 
-The schema has a version (`schema_info`). If the code's version changes, delete the
-database file and load again; the cache files are the source of truth.
+The schema has a version (`schema_info`). `init_db()` applies additive migrations and preserves
+existing rows. If a schema version is unsupported, it stops with an error rather than deleting or
+rebuilding the database.
 
 DuckDB allows one writing process per file. Close other connections (or open them
 with `read_only=True`) before loading.
@@ -225,6 +226,26 @@ the checks and the five tools. It refuses to touch the main database. The stand-
 are not the real risk team or outcome judge; they only give the tools realistic rows.
 There is no stand-in simulator, so `books` is empty there.
 
+## 6. Run one Calibration Agent cycle
+
+The runner makes three serial OpenRouter attempts and stores each attempt, its tool calls,
+validation results and evidence score. If at least one attempt passes hard checks, it saves one
+final memo. If none passes, it saves the attempts and produces no memo.
+
+```powershell
+python -m shadow.data.calibration_runner --as-of 2026-09-28 --experiment-version llm_stats --dev
+```
+
+The model ID, temperature and token limit are pinned in `calibration_agent.py`. This command
+calls the LLM three times and may incur API cost; use the dev database for a controlled trial.
+The agent's tools are bound to the requested date and version and expose no database writes.
+
+Review the final memo in `memos` / `memo_advice`; inspect every model attempt in
+`calibration_attempts` and its tool trace in `calibration_attempt_tool_calls`. A review flag does
+not block a memo; a safety blocker does. When the agent proposes a risk increase but no fresh
+decision-book snapshot exists, category advice is retained while the accepted risk level stays
+at its previous value.
+
 **The sample** (in `warehouse/sample_upstream_cache/`): NVDA and JPM on 2026-09-01, 02, 03,
 04 and 08 (09-07 was Labor Day): 12 runs including retries, $0.30. The folder also
 keeps the four NVDA 09-01 test runs made while setting up (temperature 0.0 and 8192
@@ -238,6 +259,21 @@ tokens; superseded).
 
 Expect about one run in four to need the 0.6 retry, and the occasional pair that
 still fails; check `incomplete_runs` after every batch.
+
+## 7. View a saved Calibration Agent memo
+
+Use `memo_report` to display the full memo and its structured per-category advice. The command
+opens DuckDB read-only; it does not call the model or change records.
+
+```powershell
+python -m shadow.data.memo_report --memo-id memo_dfa44371d6f5 --dev
+python -m shadow.data.memo_report --experiment-version stats_dev --cycle-date 2026-10-22 --dev
+python -m shadow.data.memo_report --experiment-version stats_dev --dev --json
+```
+
+Omit `--cycle-date` to show the latest memo for that experiment. Use `--db PATH` instead of
+`--dev` to select another database.
+
 
 ## Rules
 
