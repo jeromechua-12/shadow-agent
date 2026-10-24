@@ -75,3 +75,5 @@ class AgentState(MessagesState):
     final_trade_decision: Annotated[str, "Final decision made by the Risk Analysts"]
     past_context: Annotated[str, "Memory log context injected at run start (same-ticker decisions + cross-ticker lessons)"]
     portfolio_context: Annotated[str, "Caller-supplied holdings and cash, rendered at run start; empty when not provided"]
+    risk_memo: Annotated[str, "Current calibration memo text for the risk team; empty when there is no current memo"]
+    risk_memo_id: Annotated[str, "memo_id of risk_memo, recorded on decisions; empty when there is no current memo"]
