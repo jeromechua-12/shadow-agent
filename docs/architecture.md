@@ -67,6 +67,11 @@
 - **Fair comparison**
   - All setups scored on the same stock-and-date decisions
 
+# Evaluation Metrics
+- Rejection precision = correct rejections / (correct rejections + missed gains)
+- Net value of rejections (avoided loss - missed gain) 
+- Approval loss rate = approval losses / (approval losses + correct approvals)
+
 # Evaluation Setups
 | Setup | Description | What it shows |
 |---|---|---|

@@ -10,7 +10,7 @@ It uses Python 3.13.
 - `research_agent/shadow` contains the new shadow portfolio and calibration agent.
 
 # Design Architecture
-- Refer to `docs/architecture.md`.
+- Refer to `docs/architecture.md` for any architecture/system design needed for the code.
 
 # Code convention
 - Use fucntions and keep each function focused one clear responsibility.
