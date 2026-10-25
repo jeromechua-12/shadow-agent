@@ -208,6 +208,16 @@ def get_portfolio_context_from_state(state: Mapping[str, Any]) -> str:
     )
 
 
+def get_risk_memo_from_state(state: Mapping[str, Any]) -> str:
+    """Return the current risk memo for the risk team, or "" when there is none.
+
+    Unlike portfolio context, an absent memo adds nothing: a run without
+    calibration must see the same prompt as upstream.
+    """
+    memo = state.get("risk_memo")
+    return memo.strip() if isinstance(memo, str) else ""
+
+
 def create_msg_delete():
     def delete_messages(state):
         """Clear messages and add a context-anchored placeholder.

@@ -19,6 +19,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "pytz>=2025.2",
     "questionary>=2.1.0",
+    "duckdb>=1.1",
     "requests>=2.32.4",
     "rich>=14.0.0",
     "typer>=0.21.0",
@@ -37,6 +38,13 @@ dev = [
 # stays lean: pip install "tradingagents[bedrock]".
 bedrock = [
     "langchain-aws>=1.5.0",
+]
+
+# uv installs this group by default, so `uv run pytest` works without --extra dev.
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-subtests>=0.13",
 ]
 
 [project.scripts]
