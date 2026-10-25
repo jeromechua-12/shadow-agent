@@ -14,6 +14,7 @@ from tradingagents.agents.context import (
     get_instrument_context_from_state,
     get_language_instruction,
     get_portfolio_context_from_state,
+    get_risk_memo_from_state,
 )
 from tradingagents.agents.schemas import PortfolioDecision, render_pm_decision
 from tradingagents.agents.structured import (
@@ -29,6 +30,8 @@ def create_portfolio_manager(llm):
     def portfolio_manager_node(state) -> dict:
         instrument_context = get_instrument_context_from_state(state)
         portfolio_context = get_portfolio_context_from_state(state)
+        risk_memo = get_risk_memo_from_state(state)
+        memo_block = f"{risk_memo}\n\n" if risk_memo else ""
 
         history = state["risk_debate_state"]["history"]
         risk_debate_state = state["risk_debate_state"]
@@ -48,7 +51,7 @@ def create_portfolio_manager(llm):
 
 {portfolio_context}
 
----
+{memo_block}---
 
 **Rating Scale** (use exactly one):
 - **Buy**: Strong conviction to enter or add to position
