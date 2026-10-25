@@ -1,7 +1,7 @@
 """End-of-project evaluation: SPY buy-and-hold vs original vs feedback.
 
 Per setup: weekly returns (calendar weeks ending Friday) from daily book values,
-Sharpe with a bootstrap CI, and Wilcoxon signed-rank tests on weekly return
+Sharpe over the 3-month T-bill (^IRX) with a bootstrap CI, and Wilcoxon signed-rank tests on weekly return
 differences. Per runner version: rejection precision, net value of rejections
 and approval loss rate, on the stock-dates both versions decided (noise excluded).
 
@@ -27,6 +27,7 @@ from shadow.sim.config import DEFAULT, SimConfig
 
 PriceProvider = Callable[[str, str], pd.DataFrame]  # (ticker, as_of) -> OHLCV rows up to as_of
 SPY = "spy_buy_and_hold"
+RISK_FREE = "^IRX"   # 13-week T-bill yield, percent a year
 N_BOOT = 10_000
 CI_LEVEL = 0.95
 FLAT = 1e-12   # std at or below this counts as zero (float rounding on constant returns)
@@ -42,26 +43,35 @@ def book_values(con: duckdb.DuckDBPyConnection, version: str) -> pd.Series:
 
 
 def spy_values(days: pd.DatetimeIndex, price_provider: PriceProvider, config: SimConfig = DEFAULT) -> pd.Series:
-    """SPY buy-and-hold value: cash on day one, buy at the next open, mark at each close."""
+    """SPY buy-and-hold value: buy at the open of the first date, mark at each close."""
     df = price_provider("SPY", days[-1].date().isoformat())
     df = df.set_index(pd.to_datetime(df["Date"].astype(str).str[:10]))
     try:
-        shares = config.starting_cash * (1 - config.transaction_cost) / float(df.loc[days[1], "Open"])
-        closes = df.loc[days[1:], "Close"].astype(float)
+        shares = config.starting_cash * (1 - config.transaction_cost) / float(df.loc[days[0], "Open"])
+        return shares * df.loc[days, "Close"].astype(float)
     except KeyError as e:
         raise ValueError(f"missing SPY price: {e}") from e
-    return pd.concat([pd.Series({days[0]: config.starting_cash}), shares * closes])
 
 
-def weekly_returns(values: pd.Series) -> pd.Series:
-    """Return per calendar week ending Friday; the first week is measured from the first value."""
+def risk_free_weekly(days: pd.DatetimeIndex, price_provider: PriceProvider) -> float:
+    """Weekly risk-free rate: mean 3-month T-bill yield (^IRX, percent) over ``days``."""
+    df = price_provider(RISK_FREE, days[-1].date().isoformat())
+    dates = pd.to_datetime(df["Date"].astype(str).str[:10])
+    closes = df.loc[(dates >= days[0]) & (dates <= days[-1]), "Close"].astype(float).dropna()
+    if closes.empty:
+        raise ValueError(f"no {RISK_FREE} yields between {days[0].date()} and {days[-1].date()}")
+    return (1 + closes.mean() / 100) ** (1 / 52) - 1
+
+
+def weekly_returns(values: pd.Series, start: float) -> pd.Series:
+    """Return per calendar week ending Friday; the first week is measured from ``start``."""
     weekly = values.groupby(values.index.to_period("W-FRI")).last()
-    base = pd.Series([values.iloc[0]], index=[weekly.index[0] - 1])
+    base = pd.Series([start], index=[weekly.index[0] - 1])
     return pd.concat([base, weekly]).pct_change().iloc[1:]
 
 
 def sharpe(returns: np.ndarray) -> float | None:
-    """Annualised Sharpe of weekly returns (risk-free 0); None if under 2 weeks or flat."""
+    """Annualised Sharpe of weekly excess returns; None if under 2 weeks or flat."""
     if len(returns) < 2 or np.std(returns, ddof=1) <= FLAT:
         return None
     return float(np.mean(returns) / np.std(returns, ddof=1) * math.sqrt(52))
@@ -125,16 +135,20 @@ def evaluate(con: duckdb.DuckDBPyConnection, price_provider: PriceProvider | Non
         from tradingagents.dataflows.vendors.yahoo.ohlcv import load_ohlcv
         price_provider = lambda t, as_of: load_ohlcv(t, as_of, fill_gaps=False)  # noqa: E731
     values[SPY] = spy_values(values.index, price_provider)
+    rf = risk_free_weekly(values.index, price_provider)
 
-    weekly = {name: weekly_returns(values[name]) for name in values.columns}
+    start = DEFAULT.starting_cash
+    weekly = {name: weekly_returns(values[name], start) for name in values.columns}
     setups = {}
     for name, r in weekly.items():
-        dd = values[name] / values[name].cummax() - 1
-        setups[name] = {"weeks": len(r), "total_return": float(values[name].iloc[-1] / values[name].iloc[0] - 1),
-                        "max_drawdown": float(dd.min()), "sharpe": sharpe(r.to_numpy()),
-                        "sharpe_ci95": sharpe_ci(r.to_numpy(), n_boot)}
+        dd = values[name] / values[name].cummax().clip(lower=start) - 1
+        excess = r.to_numpy() - rf
+        setups[name] = {"weeks": len(r), "total_return": float(values[name].iloc[-1] / start - 1),
+                        "max_drawdown": float(dd.min()), "sharpe": sharpe(excess),
+                        "sharpe_ci95": sharpe_ci(excess, n_boot)}
     return {
         "period": [values.index[0].date().isoformat(), values.index[-1].date().isoformat()],
+        "risk_free_annual": float((1 + rf) ** 52 - 1),
         "setups": setups,
         "wilcoxon": {"feedback_vs_original": wilcoxon_test(weekly["feedback"], weekly["original"]),
                      "original_vs_spy": wilcoxon_test(weekly["original"], weekly[SPY]),
@@ -153,7 +167,8 @@ def _num(x: float | None) -> str:
 
 def render(report: dict) -> str:
     """Plain-text version of ``evaluate``'s output."""
-    lines = [f"evaluation period {report['period'][0]} to {report['period'][1]}", "", "setups:"]
+    lines = [f"evaluation period {report['period'][0]} to {report['period'][1]}",
+             f"risk-free rate ({RISK_FREE} mean): {_pct(report['risk_free_annual'])} a year", "", "setups:"]
     for name, s in report["setups"].items():
         ci = s["sharpe_ci95"]
         ci_txt = "n/a" if ci is None else f"{ci[0]:.2f} to {ci[1]:.2f}"

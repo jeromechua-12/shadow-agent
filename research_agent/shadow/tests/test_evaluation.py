@@ -29,6 +29,10 @@ TRADES = [
 
 
 def _spy(ticker, as_of):
+    if ticker == evaluation.RISK_FREE:   # 4% then 6% a year, plus a 50% day before the period
+        days = [DAYS[0] - pd.Timedelta(days=3), *DAYS]
+        yields = [50.0] + [4.0] * 20 + [6.0] * 20
+        return pd.DataFrame({"Date": [d.strftime("%Y-%m-%d") for d in days], "Close": yields})
     closes = 400 * np.cumprod(1 + np.random.default_rng(1).normal(0.001, 0.01, len(DAYS)))
     return pd.DataFrame({"Date": DAYS.strftime("%Y-%m-%d"), "Open": closes / 1.002, "Close": closes})
 
@@ -58,16 +62,16 @@ def con(tmp_path):
     return con
 
 
-def test_weekly_returns_use_friday_closes_and_first_value():
-    values = pd.Series([100.0, 105.0, 110.0, 99.0], index=pd.to_datetime(
+def test_weekly_returns_use_friday_closes_and_start_value():
+    values = pd.Series([101.0, 105.0, 110.0, 99.0], index=pd.to_datetime(
         ["2026-09-07", "2026-09-11", "2026-09-17", "2026-09-18"]))   # Mon, Fri, Thu, Fri
-    r = evaluation.weekly_returns(values)
+    r = evaluation.weekly_returns(values, start=100.0)
     assert list(r.round(6)) == [0.05, round(99 / 105 - 1, 6)]
 
 
 def test_weekly_returns_short_holiday_week_ends_on_its_last_day():
     values = pd.Series([100.0, 102.0, 104.0], index=pd.to_datetime(["2026-11-20", "2026-11-25", "2026-11-26"]))
-    r = evaluation.weekly_returns(values)
+    r = evaluation.weekly_returns(values, start=100.0)
     assert list(r.round(6)) == [0.0, 0.04]
 
 
@@ -86,19 +90,29 @@ def test_sharpe_ci_brackets_the_estimate_and_is_reproducible():
     assert evaluation.sharpe_ci(np.array([0.01] * 10), n_boot=200) is None
 
 
-def test_spy_starts_in_cash_and_buys_at_next_open_with_cost():
+def test_spy_buys_at_first_open_with_cost():
     days = pd.DatetimeIndex(DAYS[:3])
     v = evaluation.spy_values(days, _spy)
     prices = _spy("SPY", "").set_index(pd.to_datetime(_spy("SPY", "")["Date"]))
-    shares = 100_000 * 0.999 / prices.loc[days[1], "Open"]
-    assert v.iloc[0] == 100_000
-    assert list(v.iloc[1:]) == pytest.approx(list(shares * prices.loc[days[1:], "Close"]))
+    shares = 100_000 * 0.999 / prices.loc[days[0], "Open"]
+    assert list(v) == pytest.approx(list(shares * prices.loc[days, "Close"]))
 
 
 def test_spy_missing_price_raises():
     later = pd.DatetimeIndex([DAYS[-1], DAYS[-1] + pd.Timedelta(days=3)])
     with pytest.raises(ValueError, match="missing SPY price"):
         evaluation.spy_values(later, _spy)
+
+
+def test_risk_free_averages_yields_inside_the_period_only():
+    rf = evaluation.risk_free_weekly(DAYS, _spy)
+    assert rf == pytest.approx(1.05 ** (1 / 52) - 1)
+
+
+def test_risk_free_without_yields_raises():
+    later = pd.DatetimeIndex([DAYS[-1] + pd.Timedelta(days=3)])
+    with pytest.raises(ValueError, match="no \\^IRX yields"):
+        evaluation.risk_free_weekly(later, _spy)
 
 
 def test_wilcoxon_reports_none_when_all_differences_are_zero():
@@ -119,6 +133,7 @@ def test_decision_quality_on_shared_stock_dates_without_noise(con):
 def test_evaluate_scores_all_three_setups(con):
     report = evaluation.evaluate(con, price_provider=_spy, n_boot=500)
     assert report["period"] == ["2026-09-07", DAYS[-1].date().isoformat()]
+    assert report["risk_free_annual"] == pytest.approx(0.05)
     assert set(report["setups"]) == {"original", "feedback", evaluation.SPY}
     for s in report["setups"].values():
         assert s["weeks"] == 8 and s["sharpe"] is not None and s["max_drawdown"] <= 0
