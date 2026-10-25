@@ -1,0 +1,231 @@
+"""Replay the cached Trader proposals through the risk debate and Portfolio Manager, day by day.
+
+For each cached trading date, in order:
+1. On a cycle date (every ``CYCLE_DAYS`` cached dates): score due outcomes, bring
+   both ``feedback`` books up to the date, and run one calibration cycle. This
+   comes before the day's trades, since a memo applies from its own cycle date.
+2. Per setup: advance the decision book, then run the risk debate + PM on every
+   Buy/Sell proposal and log the decision. Holds are skipped.
+At the end both books of both setups are advanced to the last date.
+
+Upstream's graph is reused from the Trader onward (``update_state(as_node="Trader")``)
+with its SQLite checkpointer, so a stopped run resumes where it was. The memory
+log is off. A (setup, ticker, date) that already has a decision is skipped.
+
+    python -m shadow.data.risk_runner --dev --tickers NVDA --through 2026-09-01 --dry-run
+    python -m shadow.data.risk_runner --dev --tickers NVDA --through 2026-09-01 --max-pairs 2
+"""
+
+from __future__ import annotations
+
+import argparse
+import bisect
+import json
+import logging
+from datetime import date
+
+from shadow.data import evidence
+from shadow.data.cache_runner import REPORT_KEYS, UsageCounter, openrouter_spend, read_cache, spend_since
+from shadow.data.calibration_runner import run_cycle
+from shadow.data.db import check_schema_version, connect, resolve_db
+from shadow.data.outcome_judge import score_pending_decisions
+from shadow.data.paths import warehouse_dir
+from shadow.data.risk_memo import current_memo
+from shadow.data.writers import CATEGORIES, insert_decision
+from shadow.sim.config import DEFAULT
+from shadow.sim.simulator import advance
+from tradingagents.graph.checkpointer import get_checkpointer, thread_id
+from tradingagents.portfolio import PortfolioContext, Position
+
+logger = logging.getLogger(__name__)
+
+VERSIONS = ("original", "feedback")
+FEEDBACK = "feedback"
+CYCLE_DAYS = 20
+#: Final size per Trader action and PM rating (proposed size is always 1.0); any other rating rejects.
+FINAL_SIZE = {"Buy": {"Buy": 1.0, "Overweight": 0.5}, "Sell": {"Sell": 1.0, "Underweight": 0.5}}
+
+
+def schedule(con, through: date | None = None, cycle_days: int = CYCLE_DAYS) -> tuple[list[date], set[date]]:
+    """(cached dates up to ``through``, cycle dates among them); cycles count from the first cached date."""
+    dates = [r[0] for r in con.execute("SELECT DISTINCT trade_date FROM current_runs ORDER BY trade_date").fetchall()]
+    cycles = set(dates[cycle_days::cycle_days])
+    dates = [d for d in dates if through is None or d <= through]
+    return dates, cycles & set(dates)
+
+
+def calibrated(con, day: date) -> bool:
+    """True if the feedback setup already ran a calibration cycle on ``day``."""
+    return con.execute("SELECT 1 FROM calibration_attempts WHERE experiment_version = ? AND cycle_date = ?",
+                       [FEEDBACK, day]).fetchone() is not None
+
+
+def pending_pairs(con, version: str, day: date, tickers=None) -> list[tuple[str, str, str]]:
+    """(run_id, ticker, action) for the day's Buy/Sell proposals that ``version`` has not decided yet."""
+    rows = con.execute(
+        "SELECT r.run_id, r.ticker, p.action FROM current_runs r JOIN trader_proposals p ON p.run_id = r.run_id "
+        "WHERE r.trade_date = ? AND p.action IN ('Buy', 'Sell') AND NOT EXISTS (SELECT 1 FROM decisions d "
+        "WHERE d.experiment_version = ? AND d.ticker = r.ticker AND d.trade_date = r.trade_date) "
+        "ORDER BY r.ticker", [day, version]).fetchall()
+    return [r for r in rows if tickers is None or r[1] in tickers]
+
+
+def sized_decision(action: str, pm_rating: str) -> tuple[float, str, str]:
+    """(final_size, verdict, rating to log) for a Trader action; a rejected trade is logged as Hold."""
+    final = FINAL_SIZE[action].get(pm_rating, 0.0)
+    verdict = "approved" if final == 1.0 else "reduced" if final > 0 else "rejected"
+    return final, verdict, pm_rating if final > 0 else "Hold"
+
+
+def portfolio_block(con, version: str, ticker: str, day: date) -> str:
+    """The decision book on ``day`` as the risk team sees it: holdings, cash and drawdown."""
+    row = con.execute("SELECT cash, positions, drawdown FROM book_snapshots WHERE experiment_version = ? "
+                      "AND book = 'decision' AND snapshot_date <= ? ORDER BY snapshot_date DESC LIMIT 1",
+                      [version, day]).fetchone()
+    cash, held, drawdown = row if row else (DEFAULT.starting_cash, {}, 0.0)
+    held = json.loads(held) if isinstance(held, str) else (held or {})
+    book = PortfolioContext(cash=cash, currency="USD",
+                            positions=[Position(ticker=t, quantity=q) for t, q in held.items() if q])
+    return f"{book.render(ticker)}\n- Drawdown from peak: {drawdown:.1%}"
+
+
+def run_pair(graph, checkpoint_dir, run_id: str, ticker: str, day: date, version: str,
+             portfolio: str, memo: dict | None) -> tuple[dict | None, dict]:
+    """Risk debate + PM on one cached proposal; returns (PM fields, final state).
+
+    PM fields are None when the PM fell back to free text, or the thread had already finished.
+    """
+    cache = read_cache(ticker, day.isoformat())
+    if cache is None or cache["run_id"] != run_id:
+        raise RuntimeError(f"cache file for {ticker} {day} is missing or not current run {run_id}")
+    outputs = cache["outputs"]
+    state = graph.propagator.create_initial_state(
+        ticker, day.isoformat(), instrument_context=outputs["instrument_context"], portfolio_context=portfolio,
+        risk_memo=memo["memo_text"] if memo else "", risk_memo_id=memo["memo_id"] if memo else None)
+    state.update({k: outputs[k] for k in (*REPORT_KEYS, "investment_plan", "trader_investment_plan")})
+    state["investment_debate_state"].update(outputs["investment_debate"])
+
+    args = graph.propagator.get_graph_args()
+    signature = f"risk|{version}|memo={memo['memo_id'] if memo else 'none'}"
+    args["config"]["configurable"] = {"thread_id": thread_id(ticker, day.isoformat(), signature)}
+    with get_checkpointer(checkpoint_dir, ticker) as saver, evidence.capture() as rec:
+        app = graph.workflow.compile(checkpointer=saver)
+        snap = app.get_state(args["config"])
+        if not snap.values:
+            app.update_state(args["config"], state, as_node="Trader")
+        elif not snap.next:
+            return None, snap.values
+        for _ in app.stream(None, **args):
+            pass
+        final = app.get_state(args["config"]).values
+    return rec.structured.get("pm_decision"), final
+
+
+def run(db_path, graph, *, tickers=None, through: date | None = None, cycle_days: int = CYCLE_DAYS,
+        checkpoint_dir=None, calendar: list[date] | None = None, price_provider=None,
+        calibrate=run_cycle) -> dict:
+    """Replay every cached date up to ``through`` for both setups; returns counts of what was done."""
+    if calendar is None:
+        from shadow.data.conditions import trading_calendar
+        calendar = trading_calendar()
+    days = sorted(calendar)
+    checkpoint_dir = checkpoint_dir or warehouse_dir() / "risk_runner"
+    sim = {"calendar": days, "price_provider": price_provider}
+    evidence.install()
+    done = {"decisions": 0, "no_decision": 0, "cycles": 0}
+
+    con = connect(db_path)
+    try:
+        check_schema_version(con, db_path)
+        dates, cycles = schedule(con, through, cycle_days)
+        for day in dates:
+            i = bisect.bisect_left(days, day)
+            before = days[i - 1] if i else None
+            if day in cycles and not calibrated(con, day):
+                score_pending_decisions(con, today=day, calendar=days, price_provider=price_provider)
+                for book in ("decision", "shadow"):
+                    advance(con, experiment_version=FEEDBACK, book=book, to_date=day, decisions_through=before, **sim)
+                # The calibration runner opens its own connections to the same file.
+                con.close()
+                calibrate(as_of=day.isoformat(), experiment_version=FEEDBACK, db_path=db_path)
+                con = connect(db_path)
+                done["cycles"] += 1
+            for version in VERSIONS:
+                advance(con, experiment_version=version, book="decision", to_date=day,
+                        decisions_through=before, **sim)
+                memo = current_memo(con, day, FEEDBACK) if version == FEEDBACK else None
+                for run_id, ticker, action in pending_pairs(con, version, day, tickers):
+                    portfolio = portfolio_block(con, version, ticker, day)
+                    fields, final = run_pair(graph, checkpoint_dir, run_id, ticker, day, version, portfolio, memo)
+                    if fields is None:
+                        logger.warning("%s %s %s: no structured PM decision; nothing logged", version, ticker, day)
+                        done["no_decision"] += 1
+                        continue
+                    size, verdict, rating = sized_decision(action, fields["rating"])
+                    insert_decision(con, run_id=run_id, experiment_version=version, verdict=verdict,
+                                    proposed_size=1.0, final_size=size,
+                                    risk_ratings={c: fields[c] for c in CATEGORIES},
+                                    main_reason=fields["main_reason"], explanation=final["final_trade_decision"],
+                                    pm_rating=rating, memo_id=final["risk_memo_id"])
+                    done["decisions"] += 1
+        if dates:
+            for version in VERSIONS:
+                for book in ("decision", "shadow"):
+                    advance(con, experiment_version=version, book=book, to_date=dates[-1],
+                            decisions_through=dates[-1], **sim)
+    finally:
+        con.close()
+    return done
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Replay cached proposals through the risk debate and PM.")
+    parser.add_argument("--db", help="DuckDB file (default warehouse/calibration.duckdb)")
+    parser.add_argument("--dev", action="store_true", help="use warehouse/dev.duckdb")
+    parser.add_argument("--tickers", nargs="+", help="only these tickers (default: all cached)")
+    parser.add_argument("--through", type=date.fromisoformat, help="stop after this date (YYYY-MM-DD)")
+    parser.add_argument("--cycle-days", type=int, default=CYCLE_DAYS, help="cached dates per calibration cycle")
+    parser.add_argument("--max-pairs", type=int, default=1,
+                        help="refuse to start more risk-stage LLM runs than this (default 1)")
+    parser.add_argument("--max-cycles", type=int, default=0,
+                        help="refuse to start more calibration cycles than this (default 0)")
+    parser.add_argument("--dry-run", action="store_true", help="only report what would run")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    tickers = [t.upper() for t in args.tickers] if args.tickers else None
+
+    path = resolve_db(args.db, args.dev)
+    con = connect(path, read_only=True)
+    try:
+        check_schema_version(con, path)
+        dates, cycles = schedule(con, args.through, args.cycle_days)
+        pairs = sum(len(pending_pairs(con, v, d, tickers)) for d in dates for v in VERSIONS)
+        due = sorted(d for d in cycles if not calibrated(con, d))
+    finally:
+        con.close()
+    print(f"database: {path}")
+    print(f"dates: {len(dates)} ({dates[0] if dates else '-'}..{dates[-1] if dates else '-'})")
+    print(f"risk-stage runs to do: {pairs}; calibration cycles to do: {len(due)} {[d.isoformat() for d in due]}")
+    if args.dry_run:
+        return 0
+    if pairs > args.max_pairs or len(due) > args.max_cycles:
+        print(f"refusing: limits are --max-pairs {args.max_pairs} and --max-cycles {args.max_cycles}")
+        return 2
+
+    from shadow.data.settings import ANALYSTS, shadow_config
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+    config = shadow_config()
+    if config["llm_provider"] != "openrouter":
+        raise RuntimeError(f"llm_provider is {config['llm_provider']!r}; expected openrouter (check research_agent/.env)")
+    usage = UsageCounter()
+    graph = TradingAgentsGraph(selected_analysts=ANALYSTS, config=config, callbacks=[usage])
+    spend_before = openrouter_spend()
+    done = run(path, graph, tickers=tickers, through=args.through, cycle_days=args.cycle_days)
+    spent = spend_since(spend_before)
+    print(f"done: {done}; risk-stage usage {usage.as_dict()}")
+    print(f"OpenRouter spend: {f'${spent:.4f}' if spent is not None else 'unknown'} (key total, includes calibration)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

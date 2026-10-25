@@ -97,6 +97,7 @@ class TestNullishFloatCoercion:
             executive_summary="s",
             investment_thesis="t",
             price_target="N/A",
+            volatility=1, event_risk=1, valuation=1, liquidity=0, concentration=0, main_reason="none",
         )
         assert d.price_target is None
 
@@ -515,7 +516,9 @@ def test_a_price_written_as_a_range_drops_only_that_field(written):
     from tradingagents.agents.schemas import PortfolioDecision, PortfolioRating
 
     decision = PortfolioDecision(rating=PortfolioRating.BUY, executive_summary="s",
-                                 investment_thesis="t", price_target=written)
+                                 investment_thesis="t", price_target=written,
+                                 volatility=1, event_risk=1, valuation=1, liquidity=0, concentration=0,
+                                 main_reason="none")
     assert decision.price_target is None
 
 
@@ -524,7 +527,9 @@ def test_a_price_that_is_a_number_survives():
     from tradingagents.agents.schemas import PortfolioDecision, PortfolioRating
 
     decision = PortfolioDecision(rating=PortfolioRating.BUY, executive_summary="s",
-                                 investment_thesis="t", price_target="$1,150.25")
+                                 investment_thesis="t", price_target="$1,150.25",
+                                 volatility=1, event_risk=1, valuation=1, liquidity=0, concentration=0,
+                                 main_reason="none")
     assert decision.price_target == 1150.25
 
 
@@ -534,7 +539,8 @@ def test_a_field_the_model_did_not_give_says_so():
     from tradingagents.agents.schemas import PortfolioDecision, PortfolioRating, render_pm_decision
 
     rendered = render_pm_decision(PortfolioDecision(
-        rating=PortfolioRating.HOLD, executive_summary="s", investment_thesis="t"))
+        rating=PortfolioRating.HOLD, executive_summary="s", investment_thesis="t",
+        volatility=1, event_risk=1, valuation=1, liquidity=0, concentration=0, main_reason="none"))
     assert "Price Target" in rendered and "not provided" in rendered.lower()
 
 

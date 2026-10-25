@@ -89,6 +89,7 @@ def test_portfolio_manager_prompt_states_constraint():
             rating=PortfolioRating.HOLD,
             executive_summary="x",
             investment_thesis="y",
+            volatility=1, event_risk=1, valuation=1, liquidity=0, concentration=0, main_reason="none",
         ),
     )
     risk = {

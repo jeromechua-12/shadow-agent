@@ -8,7 +8,7 @@ active in the calling context:
 - every implementation in ``router.VENDOR_METHODS``: one attempt per vendor
   tried, so a fallback chain such as "sec_edgar,yfinance" shows who served it.
 - the sentiment analyst's StockTwits and Reddit fetches, which bypass the router.
-- the render functions of the sentiment, research-plan and trader schemas, so
+- the render functions of the sentiment, research-plan, trader and PM schemas, so
   their structured fields are kept as numbers before they become prose.
 - a log handler on the ``tradingagents`` logger: vendor warnings logged during
   a call are attached to it (that is where an HTTP 403 shows up).
@@ -356,6 +356,7 @@ def install() -> None:
         if _installed:
             return
         import tradingagents.agents.analysts.sentiment_analyst as sentiment
+        import tradingagents.agents.managers.portfolio_manager as portfolio_manager
         import tradingagents.agents.managers.research_manager as research_manager
         import tradingagents.agents.tools as tools
         import tradingagents.agents.trader.trader as trader
@@ -366,6 +367,7 @@ def install() -> None:
         _hook(sentiment, "render_sentiment_report", lambda f: _wrap_render("sentiment_report", f))
         _hook(research_manager, "render_research_plan", lambda f: _wrap_render("research_plan", f))
         _hook(trader, "render_trader_proposal", lambda f: _wrap_render("trader_proposal", f))
+        _hook(portfolio_manager, "render_pm_decision", lambda f: _wrap_render("pm_decision", f))
 
         logger_ = logging.getLogger("tradingagents")
         if not any(isinstance(h, _CallLogHandler) for h in logger_.handlers):
