@@ -35,7 +35,8 @@ STRUCTURED = {
         recommendation=schemas.PortfolioRating.OVERWEIGHT, rationale="r", strategic_actions="a"),
     schemas.TraderProposal: schemas.TraderProposal(action=schemas.TraderAction.BUY, reasoning="r"),
     schemas.PortfolioDecision: schemas.PortfolioDecision(
-        rating=schemas.PortfolioRating.OVERWEIGHT, executive_summary="s", investment_thesis="t"),
+        rating=schemas.PortfolioRating.OVERWEIGHT, executive_summary="s", investment_thesis="t",
+        volatility=1, event_risk=1, valuation=1, liquidity=0, concentration=0, main_reason="none"),
     schemas.SentimentReport: schemas.SentimentReport(
         overall_band=schemas.SentimentBand.NEUTRAL, overall_score=5.0, confidence="low", narrative="n"),
 }

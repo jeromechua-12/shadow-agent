@@ -237,6 +237,38 @@ class PortfolioDecision(BaseModel):
             "support a call."
         ),
     )
+    volatility: int = Field(
+        ge=0, le=3,
+        description="Volatility risk of this trade: 0 none, 1 low, 2 moderate, 3 high.",
+    )
+    event_risk: int = Field(
+        ge=0, le=3,
+        description=(
+            "Event risk (earnings, legal, macro or company news ahead): "
+            "0 none, 1 low, 2 moderate, 3 high."
+        ),
+    )
+    valuation: int = Field(
+        ge=0, le=3,
+        description="Valuation risk (price stretched against fundamentals): 0 none, 1 low, 2 moderate, 3 high.",
+    )
+    liquidity: int = Field(
+        ge=0, le=3,
+        description="Liquidity risk (difficulty trading the size without moving the price): 0 none, 1 low, 2 moderate, 3 high.",
+    )
+    concentration: int = Field(
+        ge=0, le=3,
+        description=(
+            "Concentration risk (too much of the portfolio in this name or "
+            "correlated holdings): 0 none, 1 low, 2 moderate, 3 high."
+        ),
+    )
+    main_reason: Literal["volatility", "event_risk", "valuation", "liquidity", "concentration", "none"] = Field(
+        description=(
+            "The risk category that most shaped the rating, or 'none' if no "
+            "risk changed the Trader's proposal."
+        ),
+    )
     executive_summary: str = Field(
         description=(
             "A concise action plan covering entry strategy, position sizing, "
@@ -275,6 +307,10 @@ def render_pm_decision(decision: PortfolioDecision) -> str:
     """
     parts = [
         f"**Rating**: {decision.rating.value}",
+        "",
+        f"**Risk Ratings (0-3)**: volatility {decision.volatility}, event risk {decision.event_risk}, "
+        f"valuation {decision.valuation}, liquidity {decision.liquidity}, "
+        f"concentration {decision.concentration}; main reason: {decision.main_reason}",
         "",
         f"**Executive Summary**: {decision.executive_summary}",
         "",
