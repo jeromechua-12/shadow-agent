@@ -1,4 +1,4 @@
-"""Current memo lookup: the latest memo written before the trading day, same version only."""
+"""Current memo lookup: the latest memo written on or before the trading day, same version only."""
 
 import pytest
 
@@ -26,10 +26,10 @@ def test_no_memos_returns_none(con):
     assert current_memo(con, "2026-09-01", "feedback") is None
 
 
-def test_memo_starts_the_day_after_its_cycle(con):
+def test_memo_starts_on_its_cycle_date(con):
     memo_id = add_memo(con, "feedback", "2026-08-31", "first memo")
-    assert current_memo(con, "2026-08-31", "feedback") is None
-    assert current_memo(con, "2026-09-01", "feedback") == {"memo_id": memo_id, "memo_text": "first memo"}
+    assert current_memo(con, "2026-08-30", "feedback") is None
+    assert current_memo(con, "2026-08-31", "feedback") == {"memo_id": memo_id, "memo_text": "first memo"}
 
 
 def test_memo_has_no_age_limit(con):
@@ -40,8 +40,8 @@ def test_memo_has_no_age_limit(con):
 def test_newer_memo_replaces_older(con):
     add_memo(con, "feedback", "2026-08-31", "first memo")
     newer = add_memo(con, "feedback", "2026-09-28", "second memo")
-    assert current_memo(con, "2026-09-29", "feedback")["memo_id"] == newer
-    assert current_memo(con, "2026-09-28", "feedback")["memo_text"] == "first memo"
+    assert current_memo(con, "2026-09-28", "feedback")["memo_id"] == newer
+    assert current_memo(con, "2026-09-27", "feedback")["memo_text"] == "first memo"
 
 
 def test_other_version_is_ignored(con):
