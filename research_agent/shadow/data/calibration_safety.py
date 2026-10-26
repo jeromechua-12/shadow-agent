@@ -15,7 +15,10 @@ MIN_RISK_LEVEL = 1
 DEFAULT_RISK_LEVEL = 3
 MAX_DRAWDOWN_FOR_MORE_RISK = -0.10
 RECENT_SNAPSHOT_DAYS = 7
-UNSTRUCTURED_NUMBER = re.compile(r"(?<![A-Za-z_])\d+(?:\.\d+)?%?(?![A-Za-z_])")
+TOOLS = ("cycle_summary", "search_trades", "read_trade", "subgroup_stats", "past_memos")
+# Statistics in prose (decimals, percentages) must be numeric_claims; whole numbers like "level 3" may stay.
+UNSTRUCTURED_NUMBER = re.compile(
+    r"(?<![A-Za-z_\d.])(?:\d+(?:\.\d+)?\s?(?:%|percent\b)|\d+\.\d+(?![A-Za-z_\d]))", re.IGNORECASE)
 
 
 @dataclass
@@ -117,6 +120,9 @@ def validate_output(
             level = previous_risk_level
 
     call_by_seq = {int(call["seq"]): call for call in tool_calls if "seq" in call}
+    for call in tool_calls:
+        if call.get("tool") not in TOOLS:
+            blockers.append({"code": "unknown_tool", "tool": call.get("tool"), "tool_call_seq": call.get("seq")})
     if not any(call.get("tool") == "cycle_summary" for call in tool_calls):
         blockers.append({"code": "missing_cycle_summary", "message": "cycle_summary must be consulted"})
     if not any(call.get("tool") == "past_memos" for call in tool_calls):
@@ -159,7 +165,16 @@ def validate_output(
             blockers.append({"code": "numeric_claim_mismatch", "statement": claim.statement,
                              "claimed": claim.value, "tool_value": actual})
 
+    # Only hypotheses past_memos returned (same version, earlier cycle) can be checked, once each.
+    known_hypotheses = {h.get("hypothesis_id") for call in tool_calls if call.get("tool") == "past_memos"
+                        and isinstance(call.get("result"), dict)
+                        for h in call["result"].get("hypotheses") or [] if isinstance(h, dict)}
+    checked = [check.hypothesis_id for check in output.hypothesis_checks]
+    for hypothesis_id in sorted({h for h in checked if checked.count(h) > 1}):
+        blockers.append({"code": "duplicate_hypothesis_check", "hypothesis_id": hypothesis_id})
     for check in output.hypothesis_checks:
+        if check.hypothesis_id not in known_hypotheses:
+            blockers.append({"code": "unknown_hypothesis", "hypothesis_id": check.hypothesis_id})
         call = call_by_seq.get(check.evidence_tool_call_seq)
         if call is None:
             blockers.append({"code": "unknown_hypothesis_evidence", "hypothesis_id": check.hypothesis_id})

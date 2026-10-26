@@ -24,6 +24,32 @@ def test_one_attempt_per_cycle(tmp_path, monkeypatch):
     con.close()
 
 
+def test_a_memo_the_writer_rejects_is_reported_not_raised(tmp_path, monkeypatch):
+    from shadow.data.calibration_models import CATEGORIES, CalibrationOutput
+    from shadow.data.writers import InvalidRecord
+
+    path = tmp_path / "c.duckdb"
+    init_db(path).close()
+    output = CalibrationOutput.model_validate({
+        "summary": "Evidence is mixed.", "risk_level": 3, "risk_level_rationale": "First cycle.",
+        "advice": {c: {"advice": "keep", "confidence": "low", "reasoning": "Thin."} for c in CATEGORIES}})
+    calls = [{"seq": 1, "tool": "cycle_summary", "args": {}, "result": {}},
+             {"seq": 2, "tool": "past_memos", "args": {}, "result": {"memos": [], "hypotheses": []}}]
+
+    def reject(*args, **kwargs):
+        raise InvalidRecord("memo", ["writer said no"])
+
+    monkeypatch.setattr(calibration_runner, "run_attempt",
+                        lambda model, tools, **kw: AttemptResult(output=output, tool_calls=calls))
+    monkeypatch.setattr(calibration_runner, "insert_memo", reject)
+    result = calibration_runner.run_cycle(as_of="2026-09-28", experiment_version="feedback", db_path=path,
+                                          llm=object())
+    assert result["status"] == "memo_rejected" and result["error"] == "writer said no"
+    con = connect(path, read_only=True)
+    assert con.execute("SELECT count(*) FROM calibration_attempts").fetchone() == (1,)
+    con.close()
+
+
 def test_calibration_llm_uses_the_protocol_temperature(monkeypatch):
     from shadow.data import calibration_agent
     from tradingagents.llm_clients import factory

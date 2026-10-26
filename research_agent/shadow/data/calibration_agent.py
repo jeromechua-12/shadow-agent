@@ -45,7 +45,8 @@ including the tool call sequence and JSON pointer to the exact returned number. 
 raw tool output as {"tool_call_seq": N, "result": RAW_JSON}; JSON pointers must be relative to
 RAW_JSON and must omit the wrapper prefix. For example, use /by_category/event_risk/all_history/n_scored,
 not /result/by_category/event_risk/all_history/n_scored. Apply the same raw-result rule to hypothesis
-evidence pointers. Do not put digits in free-text fields; write numeric facts as numeric_claims. If
+evidence pointers. Do not write decimals or percentages in free-text fields; write them as
+numeric_claims. Whole numbers such as a risk level or a day count may appear in text. If
 evidence is weak, say so. Include a conflict_rationale when departing from prior advice despite
 P(success rate > 50%) >= 0.85. Choose one overall risk level and explain it in risk_level_rationale.
 If is_first_cycle is true, risk_level MUST be exactly 3 regardless of evidence. Do not invent numbers,

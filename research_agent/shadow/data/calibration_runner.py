@@ -18,7 +18,7 @@ from shadow.data.calibration_models import CATEGORIES
 from shadow.data.calibration_safety import SafetyResult, json_pointer_value, validate_output
 from shadow.data.db import check_schema_version, connect, init_db, resolve_db
 from shadow.data.queries import CalibrationTools
-from shadow.data.writers import insert_calibration_attempts, insert_memo
+from shadow.data.writers import InvalidRecord, insert_calibration_attempts, insert_memo
 
 ATTEMPT_COUNT = 1   # the evaluation protocol runs calibration once per point
 
@@ -197,23 +197,28 @@ def run_cycle(*, as_of: str, experiment_version: str, db_path=None,
                 "conditions": value.conditions,
                 "watch_next": value.watch_next,
             }
-        output = insert_memo(
-            write_con, experiment_version=experiment_version, cycle_date=cycle_date,
-            risk_level=selected_output.risk_level, risk_level_rationale=selected_output.risk_level_rationale,
-            memo_text=render_memo(selected_output, selected_safety, cycle_date, experiment_version),
-            advice=advice, safety_passed=True,
-            safety_flags={"flags": selected_safety.flags,
-                          "attempt_spread": {"risk_levels": [r.output.risk_level for r, _ in checked if r.output],
-                                             "advice": {cat: [r.output.advice[cat].advice
-                                                              for r, _ in checked if r.output]
-                                                        for cat in CATEGORIES}},
-                          "selected_attempt_id": selected_record["attempt_id"],
-                          "proposed_risk_level": selected_result.output.risk_level},
-            model=CALIBRATION_MODEL,
-            hypotheses=[h.model_dump(mode="json") for h in selected_output.hypotheses],
-            hypothesis_checks=_hypothesis_checks(selected_output, selected_result.tool_calls),
-            tool_calls=selected_result.tool_calls,
-        )
+        try:
+            output = insert_memo(
+                write_con, experiment_version=experiment_version, cycle_date=cycle_date,
+                risk_level=selected_output.risk_level, risk_level_rationale=selected_output.risk_level_rationale,
+                memo_text=render_memo(selected_output, selected_safety, cycle_date, experiment_version),
+                advice=advice, safety_passed=True,
+                safety_flags={"flags": selected_safety.flags,
+                              "attempt_spread": {"risk_levels": [r.output.risk_level for r, _ in checked if r.output],
+                                                 "advice": {cat: [r.output.advice[cat].advice
+                                                                  for r, _ in checked if r.output]
+                                                            for cat in CATEGORIES}},
+                              "selected_attempt_id": selected_record["attempt_id"],
+                              "proposed_risk_level": selected_result.output.risk_level},
+                model=CALIBRATION_MODEL,
+                hypotheses=[h.model_dump(mode="json") for h in selected_output.hypotheses],
+                hypothesis_checks=_hypothesis_checks(selected_output, selected_result.tool_calls),
+                tool_calls=selected_result.tool_calls,
+            )
+        except InvalidRecord as exc:
+            # The attempt is already stored; a writer rejection means no valid memo, not a crashed replay.
+            return {"calibration_run_id": calibration_run_id, "status": "memo_rejected",
+                    "attempts": len(records), "memo_id": None, "error": "; ".join(exc.problems)}
         return {"calibration_run_id": calibration_run_id, "status": "memo_written",
                 "attempts": len(records), "selected_attempt_id": selected_record["attempt_id"],
                 **output}

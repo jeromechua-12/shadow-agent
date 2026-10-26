@@ -89,6 +89,38 @@ def test_numeric_claim_must_match_exact_tool_result():
     assert any(blocker["code"] == "numeric_claim_mismatch" for blocker in result.blockers)
 
 
+def _codes(model_output, calls):
+    result = validate_output(model_output, calls, previous_risk_level=3, decision_drawdown=0.0,
+                             snapshot_date=date(2026, 9, 28), as_of=date(2026, 9, 28))
+    return {blocker["code"] for blocker in result.blockers}
+
+
+def _check(hypothesis_id):
+    return {"hypothesis_id": hypothesis_id, "status": "held", "evidence_tool_call_seq": 2,
+            "evidence_json_pointer": "/hypotheses"}
+
+
+def test_hypothesis_checks_must_name_a_known_hypothesis_once():
+    calls = [summary_call(), past_call()]
+    calls[1]["result"]["hypotheses"] = [{"hypothesis_id": "hyp_known"}]
+    assert not _codes(output(hypothesis_checks=[_check("hyp_known")]), calls)
+    assert "unknown_hypothesis" in _codes(output(hypothesis_checks=[_check("hyp_made_up")]), calls)
+    assert "duplicate_hypothesis_check" in _codes(
+        output(hypothesis_checks=[_check("hyp_known"), _check("hyp_known")]), calls)
+
+
+def test_a_tool_outside_the_five_blocks_output():
+    calls = [summary_call(), past_call(), {"seq": 3, "tool": "drop_table", "args": {}, "result": {}}]
+    assert "unknown_tool" in _codes(output(), calls)
+
+
+def test_whole_numbers_may_appear_in_text_but_statistics_may_not():
+    calls = [summary_call(), past_call()]
+    assert not _codes(output(risk_level_rationale="Hold level 3 on the first cycle; watch 10-day outcomes."), calls)
+    assert "unstructured_numeric_claim" in _codes(output(summary="The win rate was 0.62."), calls)
+    assert "unstructured_numeric_claim" in _codes(output(summary="The win rate was 62%."), calls)
+
+
 def test_85_percent_signal_flags_unexplained_departure_from_prior_advice():
     base = output()
     advice = dict(base.advice)
