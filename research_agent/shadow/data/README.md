@@ -200,9 +200,11 @@ Every command prints the cache folder it writes to. A cached pair is skipped unl
 `--rerun-incomplete` or `--rerun` asks for it.
 
 A run costs $0.02–0.034 on OpenRouter and takes 5–9 minutes; the 2 × 5 sample
-(9 runs, `--workers 2`) took 35 minutes and $0.22. `--max-runs` (default 1) refuses
-bigger batches, and the runner prints the batch's cost at the end. Runs of one ticker
-never overlap, so `--workers` helps only with several tickers.
+(9 runs, `--workers 2`) took 35 minutes and $0.22. `--max-runs` (default 1) caps
+upstream pipeline attempts, including rate-limit and token-cap retries. Each planned
+ticker/date pair gets one initial attempt; retries use the remaining budget. One
+pipeline attempt may make multiple LLM calls. The runner prints the batch's cost at
+the end. Runs of one ticker never overlap, so `--workers` helps only with several tickers.
 
 Settings are pinned in [`settings.py`](settings.py): DeepSeek V4 Flash, temperature 0.2,
 16384 max tokens, one debate round, news from Alpaca, statements from SEC EDGAR first.
@@ -308,9 +310,6 @@ Found in review and deliberately not fixed yet (numbers are the review's).
 - **8. Experiments cannot be rerun the append-only way.** `decisions`, `memos` and
   `book_snapshots` are keyed by `experiment_version` with no run ID, so rerunning an
   experiment needs a new version string. To be decided with the group.
-- **11. `--max-runs` counts pairs, not LLM runs.** One pair can make up to 8 full runs
-  (2 temperatures × 4 rate-limit attempts), so the real cost of a batch can be higher
-  than `--max-runs` suggests.
 - **15. There is a seventh status, `error`**, a catch-all marked retryable, beyond the
   six listed in CLAUDE.md.
 - **17. The ticker identity lookup has no evidence row.** It reads today's yfinance

@@ -264,12 +264,38 @@ class RateGate:
             time.sleep(min(left, 5))
 
 
+class RunBudgetExhausted(RuntimeError):
+    """Raised when the batch has no upstream attempts left."""
+
+
+class RunBudget:
+    """Shared attempt budget that reserves one initial attempt for each planned pair."""
+
+    def __init__(self, max_runs: int, planned_pairs: int):
+        self._lock = threading.Lock()
+        self._initial_pairs = set(range(planned_pairs))
+        self._retry_attempts = max_runs - planned_pairs
+
+    def consume(self, task_id: int) -> bool:
+        with self._lock:
+            if task_id in self._initial_pairs:
+                self._initial_pairs.remove(task_id)
+                return True
+            if self._retry_attempts:
+                self._retry_attempts -= 1
+                return True
+            return False
+
+
 def run_with_retries(ticker: str, trade_date: str, gate: RateGate | None = None,
-                     temperature: float = UPSTREAM_TEMPERATURE) -> dict:
+                     temperature: float = UPSTREAM_TEMPERATURE, budget: RunBudget | None = None,
+                     task_id: int | None = None) -> dict:
     gate = gate or RateGate()
     delay = RATE_LIMIT_BASE_DELAY_S
     for attempt in range(RATE_LIMIT_RETRIES + 1):
         gate.wait()
+        if budget is not None and (task_id is None or not budget.consume(task_id)):
+            raise RunBudgetExhausted("--max-runs budget exhausted before another upstream attempt")
         try:
             return run_upstream(ticker, trade_date, temperature)
         except Exception as e:
@@ -311,14 +337,15 @@ def empty_at_token_cap(record: dict) -> list[str]:
                    if c.get("finish_reason") == "length" and not c.get("content_chars") and not c.get("tool_calls")})
 
 
-def _run_once_or_retry_hotter(ticker: str, trade_date: str, gate: RateGate, previous: dict | None) -> dict:
+def _run_once_or_retry_hotter(ticker: str, trade_date: str, gate: RateGate, previous: dict | None,
+                              budget: RunBudget, task_id: int) -> dict:
     """Run at the pinned temperature; if an agent looped to the token cap, run once more hotter.
 
     A pair whose previous cached run already looped starts at the retry
     temperature. The looping attempt is kept under _superseded/.
     """
     start = RETRY_TEMPERATURE if previous is not None and empty_at_token_cap(previous) else UPSTREAM_TEMPERATURE
-    record = run_with_retries(ticker, trade_date, gate, start)
+    record = run_with_retries(ticker, trade_date, gate, start, budget, task_id)
     looped = empty_at_token_cap(record)
     if record["complete"] or not looped or start == RETRY_TEMPERATURE:
         return record
@@ -326,21 +353,29 @@ def _run_once_or_retry_hotter(ticker: str, trade_date: str, gate: RateGate, prev
           f"{', '.join(looped)} returned nothing at the token cap", flush=True)
     path = cache_path(ticker, trade_date)
     _write_atomic(path.parent / "_superseded" / f"{trade_date}.{record['run_id']}.json", record)
-    retry = run_with_retries(ticker, trade_date, gate, RETRY_TEMPERATURE)
+    try:
+        retry = run_with_retries(ticker, trade_date, gate, RETRY_TEMPERATURE, budget, task_id)
+    except RunBudgetExhausted:
+        reason = "max-runs budget exhausted before token-cap retry"
+        record["incomplete_reasons"] = list(record.get("incomplete_reasons") or []) + [reason]
+        logger.warning("Keeping incomplete run for %s %s: %s", ticker, trade_date, reason)
+        return record
     retry["retry_of"] = {"run_id": record["run_id"], "temperature": start,
                          "reason": f"empty reply at token cap: {', '.join(looped)}",
                          "cost_usd": record["usage"].get("cost_usd")}
     return retry
 
 
-def _run_and_save(ticker: str, trade_date: str, gate: RateGate, ticker_lock: threading.Lock) -> bool:
+def _run_and_save(ticker: str, trade_date: str, gate: RateGate, ticker_lock: threading.Lock,
+                  budget: RunBudget, task_id: int) -> bool:
     """Run one pair and write its cache file (or a _failed record). True on success."""
     path = cache_path(ticker, trade_date)
     # One run per ticker at a time: runs of the same ticker share price and
     # news cache files.
     with ticker_lock:
         try:
-            record = _run_once_or_retry_hotter(ticker, trade_date, gate, read_cache(ticker, trade_date))
+            record = _run_once_or_retry_hotter(
+                ticker, trade_date, gate, read_cache(ticker, trade_date), budget, task_id)
         except Exception as e:
             logger.exception("Run failed for %s %s", ticker, trade_date)
             _write_atomic(path.parent / "_failed" / f"{trade_date}.{uuid.uuid4().hex[:12]}.json", {
@@ -389,7 +424,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rerun-incomplete", action="store_true",
                         help="also rerun cached pairs marked incomplete")
     parser.add_argument("--max-runs", type=int, default=1,
-                        help="refuse to start more LLM runs than this (default 1)")
+                        help="cap upstream pipeline attempts, including retries (default 1); each attempt may make multiple LLM calls")
     parser.add_argument("--workers", type=int, default=1,
                         help="pairs run in parallel (default 1; keep small for OpenRouter limits)")
     parser.add_argument("--rerun", action="store_true",
@@ -414,23 +449,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         return 0
     if len(todo) > args.max_runs:
-        print(f"refusing: {len(todo)} runs planned but --max-runs is {args.max_runs}")
+        print(f"refusing: {len(todo)} ticker/date pairs need one attempt each, but --max-runs is {args.max_runs}")
         return 2
 
     gate = RateGate()
+    budget = RunBudget(args.max_runs, len(todo))
     ticker_locks = {t: threading.Lock() for t, _, _ in todo}
     spend_before = openrouter_spend()
     t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
         futures = []
         for i, (t, d, _) in enumerate(todo):
-            futures.append(pool.submit(_run_and_save, t, d, gate, ticker_locks[t]))
+            futures.append(pool.submit(_run_and_save, t, d, gate, ticker_locks[t], budget, i))
             if i < args.workers - 1:
                 time.sleep(STAGGER_S)  # spread the first wave's requests
         ok = sum(f.result() for f in futures)
     spent = spend_since(spend_before)
     cost = f"${spent:.4f}" if spent is not None else "unknown"
-    print(f"done: {ok}/{len(todo)} runs saved in {time.perf_counter() - t0:.0f}s; "
+    print(f"done: {ok}/{len(todo)} pairs saved in {time.perf_counter() - t0:.0f}s; "
           f"OpenRouter spend for this batch: {cost} (key total, includes any other use of the key)")
     return 0 if ok == len(todo) else 1
 
