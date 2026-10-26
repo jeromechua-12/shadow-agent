@@ -125,6 +125,12 @@ def test_cycle_summary_counts(tools):
     assert event["thin_evidence"] is True
 
 
+def test_tool_results_carry_the_cusum_verdict_but_not_its_per_trade_trace(tools):
+    assert '"trace"' not in json.dumps(all_outputs(tools))
+    trend = tools.cycle_summary()["all_history"]["trend"]
+    assert {"flagged", "direction", "flagged_at", "final_s_pos", "final_s_neg"} <= set(trend)
+
+
 def test_beta_stats():
     even = beta_stats(5, 5)
     assert even["posterior_mean"] == 0.5 and even["p_rate_above_half"] == pytest.approx(0.5, abs=1e-3)

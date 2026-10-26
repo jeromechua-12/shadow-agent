@@ -194,7 +194,8 @@ def group_stats(rows: list[dict], max_ids: int = 50) -> dict:
         "successes": s,
         "success_rate": round(s / (s + f), 4) if s + f else None,
         "beta": beta_stats(s, f),
-        "trend": cusum_trend(rows),
+        # The per-trade trace grows with history and would flood every tool result; keep the verdict.
+        "trend": {k: v for k, v in cusum_trend(rows).items() if k != "trace"},
         "mean_score_approved_parts": mean_score("approved_part"),
         "mean_score_rejected_parts": mean_score("rejected_part"),
         "thin_evidence": (s + f) < 10,
