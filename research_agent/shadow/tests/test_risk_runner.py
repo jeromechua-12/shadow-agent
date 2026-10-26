@@ -256,6 +256,29 @@ def test_outcomes_due_by_today_are_scored_at_the_end(setup, tmp_path, monkeypatc
 
 
 @pytest.mark.unit
+def test_a_second_ticker_pass_over_dates_the_books_passed_is_refused(setup, tmp_path, monkeypatch):
+    model = FakeModel(decision=_decision("Buy"))
+    graph = _graph(tmp_path, monkeypatch, model)
+    _run(setup, graph, tmp_path, [], through=CACHED[1], tickers=["NVDA"])
+    calls = len(model.calls)
+    with pytest.raises(RuntimeError, match="fills would be lost"):
+        _run(setup, graph, tmp_path, [], through=CACHED[1])         # AAPL on CACHED[0] would never fill
+    assert len(model.calls) == calls                                 # refused before any LLM call
+
+
+@pytest.mark.unit
+def test_a_missing_price_stops_the_run(setup, tmp_path, monkeypatch):
+    def prices(ticker, as_of):
+        df = _prices(ticker, as_of)
+        return df[df["Date"] != CACHED[1].isoformat()] if ticker == "NVDA" else df
+
+    graph = _graph(tmp_path, monkeypatch, FakeModel(decision=_decision("Buy")))
+    with pytest.raises(RuntimeError, match="no open for NVDA"):
+        risk_runner.run(setup, graph, cycle_days=2, checkpoint_dir=tmp_path / "ckpt", calendar=DAYS,
+                        price_provider=prices, calibrate=_fake_calibration([]), through=CACHED[1])
+
+
+@pytest.mark.unit
 def test_a_restart_skips_logged_decisions(setup, tmp_path, monkeypatch):
     model = FakeModel(decision=_decision("Buy"))
     graph = _graph(tmp_path, monkeypatch, model)

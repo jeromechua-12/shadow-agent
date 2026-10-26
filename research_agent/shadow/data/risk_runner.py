@@ -14,6 +14,11 @@ Upstream's graph is reused from the Trader onward (``update_state(as_node="Trade
 with its SQLite checkpointer, so a stopped run resumes where it was. The memory
 log is off. A (setup, ticker, date) that already has a decision is skipped.
 
+The run refuses to start if a proposal still to decide is dated before a book's last
+snapshot (e.g. a second ``--tickers`` pass): its fill could never be applied. It stops
+when a missing price halts a book, and logs outcomes it could not score and cycles
+that wrote no memo.
+
     python -m shadow.data.risk_runner --dev --tickers NVDA --through 2026-09-01 --dry-run
     python -m shadow.data.risk_runner --dev --tickers NVDA --through 2026-09-01 --max-pairs 2
 """
@@ -73,6 +78,19 @@ def pending_pairs(con, version: str, day: date, tickers=None) -> list[tuple[str,
         "WHERE d.experiment_version = ? AND d.ticker = r.ticker AND d.trade_date = r.trade_date) "
         "ORDER BY r.ticker", [day, version]).fetchall()
     return [r for r in rows if tickers is None or r[1] in tickers]
+
+
+def late_pairs(con, dates: list[date], tickers=None) -> list[tuple[str, str, date]]:
+    """(version, ticker, date) still to decide on a date a book has already passed; its fill would be lost."""
+    late = []
+    for version in VERSIONS:
+        last = con.execute("SELECT max(snapshot_date) FROM book_snapshots WHERE experiment_version = ?",
+                           [version]).fetchone()[0]
+        if last is None:
+            continue
+        late += [(version, ticker, day) for day in dates if day < last
+                 for _, ticker, _ in pending_pairs(con, version, day, tickers)]
+    return late
 
 
 def sized_decision(action: str, pm_rating: str) -> tuple[float, str, str]:
@@ -137,6 +155,22 @@ def run_pair(graph, checkpoint_dir, cache: dict, ticker: str, day: date, version
     return rec.structured.get("pm_decision"), final
 
 
+def advance_book(con, **kwargs) -> None:
+    """Advance one book; raise when a missing price stops it (later days would see a stale book)."""
+    report = advance(con, **kwargs)
+    if report.stopped_on_missing_price:
+        raise RuntimeError(f"{report.experiment_version} {report.book} book: {report.stopped_reason}; "
+                           "fix the price data and rerun (the run resumes)")
+
+
+def score_due(con, **kwargs) -> int:
+    """Score due outcomes, log any that were skipped; returns the number scored."""
+    report = score_pending_decisions(con, **kwargs)
+    for problem in report.skipped_no_price + report.errors:
+        logger.warning("outcome not scored: %s", problem)
+    return report.scored
+
+
 def run(db_path, graph, *, tickers=None, through: date | None = None, cycle_days: int = CYCLE_DAYS,
         checkpoint_dir=None, calendar: list[date] | None = None, price_provider=None,
         calibrate=run_cycle) -> dict:
@@ -154,22 +188,30 @@ def run(db_path, graph, *, tickers=None, through: date | None = None, cycle_days
     try:
         check_schema_version(con, db_path)
         dates, cycles = schedule(con, through, cycle_days)
+        if late := late_pairs(con, dates, tickers):
+            raise RuntimeError(f"{len(late)} proposal(s) are dated before their books' last snapshot, so their "
+                               f"fills would be lost (e.g. {late[:3]}); run all tickers in one pass on a fresh database")
         for day in dates:
             i = bisect.bisect_left(days, day)
             before = days[i - 1] if i else None
             if day in cycles and not calibrated(con, day):
-                done["outcomes_scored"] += score_pending_decisions(
-                    con, today=day, calendar=days, price_provider=price_provider).scored
+                done["outcomes_scored"] += score_due(con, today=day, calendar=days, price_provider=price_provider)
                 for book in ("decision", "shadow"):
-                    advance(con, experiment_version=FEEDBACK, book=book, to_date=day, decisions_through=before, **sim)
+                    advance_book(con, experiment_version=FEEDBACK, book=book, to_date=day,
+                                 decisions_through=before, **sim)
                 # The calibration runner opens its own connections to the same file.
                 con.close()
-                calibrate(as_of=day.isoformat(), experiment_version=FEEDBACK, db_path=db_path)
+                result = calibrate(as_of=day.isoformat(), experiment_version=FEEDBACK, db_path=db_path) or {}
                 con = connect(db_path)
                 done["cycles"] += 1
+                if result.get("status", "memo_written") == "memo_written":
+                    logger.info("calibration %s: memo %s written", day, result.get("memo_id"))
+                else:
+                    logger.warning("calibration %s: %s, the previous memo stays current (%s)",
+                                   day, result["status"], result.get("error") or "see calibration_attempts")
             for version in VERSIONS:
-                advance(con, experiment_version=version, book="decision", to_date=day,
-                        decisions_through=before, **sim)
+                advance_book(con, experiment_version=version, book="decision", to_date=day,
+                             decisions_through=before, **sim)
                 memo = current_memo(con, day, FEEDBACK) if version == FEEDBACK else None
                 for run_id, ticker, action in pending_pairs(con, version, day, tickers):
                     portfolio = portfolio_block(con, version, ticker, day)
@@ -203,12 +245,11 @@ def run(db_path, graph, *, tickers=None, through: date | None = None, cycle_days
         if dates:
             for version in VERSIONS:
                 for book in ("decision", "shadow"):
-                    advance(con, experiment_version=version, book=book, to_date=dates[-1],
-                            decisions_through=dates[-1], **sim)
+                    advance_book(con, experiment_version=version, book=book, to_date=dates[-1],
+                                 decisions_through=dates[-1], **sim)
             # Outcomes are otherwise scored only on cycle dates; score all that are due by
             # today so the evaluation sees the last ~10 trading days too.
-            done["outcomes_scored"] += score_pending_decisions(
-                con, calendar=days, price_provider=price_provider).scored
+            done["outcomes_scored"] += score_due(con, calendar=days, price_provider=price_provider)
     finally:
         con.close()
     return done
@@ -237,11 +278,17 @@ def main(argv: list[str] | None = None) -> int:
         dates, cycles = schedule(con, args.through, args.cycle_days)
         pairs = sum(len(pending_pairs(con, v, d, tickers)) for d in dates for v in VERSIONS)
         due = sorted(d for d in cycles if not calibrated(con, d))
+        late = late_pairs(con, dates, tickers)
     finally:
         con.close()
     print(f"database: {path}")
     print(f"dates: {len(dates)} ({dates[0] if dates else '-'}..{dates[-1] if dates else '-'})")
     print(f"risk-stage runs to do: {pairs}; calibration cycles to do: {len(due)} {[d.isoformat() for d in due]}")
+    if late:
+        print(f"refusing: {len(late)} proposal(s) are dated before their books' last snapshot, so their fills "
+              f"would be lost (e.g. {[(v, t, d.isoformat()) for v, t, d in late[:3]]}); "
+              "run all tickers in one pass on a fresh database")
+        return 2
     if args.dry_run:
         return 0
     if pairs > args.max_pairs or len(due) > args.max_cycles:
