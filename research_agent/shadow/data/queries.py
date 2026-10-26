@@ -205,6 +205,8 @@ def group_stats(rows: list[dict], max_ids: int = 50) -> dict:
 def _number(name, v):
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         raise ValueError(f"filter {name!r}: min/max must be numbers, got {v!r}")
+    if isinstance(v, float) and not math.isfinite(v):
+        raise ValueError(f"filter {name!r}: min/max must be finite numbers, got {v!r}")
     return v
 
 
@@ -227,7 +229,12 @@ def build_filters(filters: dict | None) -> tuple[str, list]:
             for bound, op in (("min", ">="), ("max", "<=")):
                 if bound in value:
                     v = value[bound]
-                    v = date.fromisoformat(v) if name == "trade_date" else _number(name, v)
+                    if name == "trade_date":
+                        if not isinstance(v, str):
+                            raise ValueError(f"filter 'trade_date': {bound} must be an ISO date string")
+                        v = date.fromisoformat(v)
+                    else:
+                        v = _number(name, v)
                     sql.append(f"AND {RANGES[name]} {op} ?")
                     params.append(v)
         elif name == "news_keyword":

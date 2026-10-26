@@ -322,8 +322,6 @@ Found in review and deliberately not fixed yet (numbers are the review's).
 - **19. Conditions use adjusted prices** (`auto_adjust=True`), so `close` is not the
   exact traded price on that date; ratios (ATR %, RSI, distance from the 200-day
   average) are mostly unaffected.
-- **20. Filter edge cases.** A non-string `trade_date` filter raises `TypeError`
-  instead of `ValueError`, and numeric filters accept NaN and infinity.
 - **21. A two-part decision is not written in one transaction.** If the second part's
   insert fails, the first part stays.
 - **22. `first_seen_at` falls back to `created_at`** when a news item has no `fetched_at`.
