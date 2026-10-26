@@ -32,7 +32,8 @@
       no extra risk after a >10% drawdown
     - 85% Beta-Binomial threshold and CUSUM are not blocking rules
   - Flags advice against strong statistics without a reason
-  - Risk memo: inserted into risk debate and PM prompts for 4 weeks
+  - Risk memo: inserted into risk debate and PM prompts until the next valid memo (normally 4 weeks)
+    - A cycle with no valid memo keeps the previous one; the gap is flagged by the data checks
 
   # Loops
 - **Daily trading loop (per stock, per trading day)**
@@ -40,7 +41,7 @@
     → two-book simulator → outcome judge (10 trading days later) → evidence database
 - **Calibration loop (every 4 simulated weeks)**
   - Statistics engine → Calibration Agent → safety checker
-    → risk memo into risk team prompts for the next 4 weeks
+    → risk memo into risk team prompts until the next valid memo (normally 4 weeks)
 
 # Evaluation Protocol
 - **Same inputs**
@@ -59,8 +60,10 @@
   - Hold proposals are not trades
   - Scores inside the noise band are excluded
 - **Variability**
-  - Fixed temperature, 0.2
-  - Calibration runs once per point
+  - Fixed temperature, 0.2, for every LLM (upstream, risk stage, Calibration Agent)
+    - Upstream only: one automatic retry at 0.6 when an agent loops and returns nothing
+  - Risk stage runs once per stock, date and setup
+  - Calibration runs once per point (one attempt per cycle)
 - **Statistical testing**
   - Bootstrap CIs on Sharpe ratio from weekly results
   - Wilcoxon signed-rank test on weekly return differences

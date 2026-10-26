@@ -17,7 +17,7 @@ from shadow.data.calibration_models import CalibrationOutput
 from shadow.data.queries import CalibrationTools
 
 CALIBRATION_MODEL = "deepseek/deepseek-v4-flash-0731"
-CALIBRATION_TEMPERATURE = 0.0
+CALIBRATION_TEMPERATURE = 0.2   # the protocol fixes every LLM at 0.2; 0.0 made DeepSeek loop upstream
 CALIBRATION_MAX_TOKENS = 16384
 MAX_TOOL_STEPS = 12
 RATE_LIMIT_RETRIES = 3

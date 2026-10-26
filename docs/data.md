@@ -39,9 +39,8 @@ Calibration loop (every 4 simulated weeks):
    strong statistics without a reason is flagged.
 10. Risk memo goes into the risk team's prompts for the next 4 weeks.
 
-Experiment: three versions on the same cache — rules with a template memo; LLM with
-statistics only; LLM with statistics plus past cases. Baselines: SPY buy-and-hold,
-original TradingAgents.
+Experiment (see docs/architecture.md): two setups on the same cache, `original` (no memo)
+and `feedback` (memo every 4 weeks), plus SPY buy-and-hold as a baseline.
 
 ## My role (Avery): data layer
 
@@ -87,11 +86,11 @@ Changes for this project:
 
 ## Environment and data status (as of 2026-10-22)
 
-- Working branch: `data-layer`. Windows, PowerShell, venv at research_agent/.venv.
+- Work is merged on `main`. Windows, PowerShell, venv at research_agent/.venv.
 - research_agent/.env holds OPENROUTER_API_KEY, ALPACA_API_KEY_ID, ALPACA_API_SECRET_KEY,
   SEC_EDGAR_USER_AGENT and FRED_API_KEY (FRED available since 2026-10-22). Code must still run
   without a key, record the source as not_configured, and allow rerunning with --rerun-incomplete.
-- LLM: DeepSeek V4 Flash via OpenRouter, temperature 0.0, max tokens 16384. (8192 was too low:
+- LLM: DeepSeek V4 Flash via OpenRouter, temperature 0.2, max tokens 16384. (8192 was too low:
   hidden reasoning used up the cap and agents returned empty text, finish_reason=length.)
   OpenRouter budget is limited (about $15); one full TradingAgents run cost about $0.02.
 - Test runs showed, for past dates:

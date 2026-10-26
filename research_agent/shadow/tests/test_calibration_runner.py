@@ -22,3 +22,22 @@ def test_one_attempt_per_cycle(tmp_path, monkeypatch):
     con = connect(path, read_only=True)
     assert con.execute("SELECT count(*) FROM calibration_attempts").fetchone() == (1,)
     con.close()
+
+
+def test_calibration_llm_uses_the_protocol_temperature(monkeypatch):
+    from shadow.data import calibration_agent
+    from tradingagents.llm_clients import factory
+
+    seen = {}
+
+    class Client:
+        def get_llm(self):
+            return "llm"
+
+    def fake_client(provider, model, **kwargs):
+        seen.update(kwargs, provider=provider, model=model)
+        return Client()
+
+    monkeypatch.setattr(factory, "create_llm_client", fake_client)
+    assert calibration_agent.build_calibration_llm() == "llm"
+    assert seen["temperature"] == 0.2 and seen["provider"] == "openrouter"

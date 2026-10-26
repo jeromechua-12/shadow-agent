@@ -112,6 +112,12 @@ SQL_CHECKS = {
     "first_memo_not_default_level": ("error", "an experiment version's first memo is not at risk level 3",
         """SELECT memo_id FROM memos m WHERE risk_level <> 3 AND NOT EXISTS (
              SELECT 1 FROM memos p WHERE p.experiment_version = m.experiment_version AND p.cycle_date < m.cycle_date)"""),
+    "cycle_without_valid_memo": ("warning", "a calibration cycle produced no valid memo; the risk team kept the "
+                                 "previous memo (report this gap)",
+        """SELECT DISTINCT a.experiment_version || ' ' || a.cycle_date FROM calibration_attempts a
+           WHERE NOT EXISTS (SELECT 1 FROM memos m WHERE m.experiment_version = a.experiment_version
+                             AND m.cycle_date = a.cycle_date)
+           ORDER BY 1"""),
     "hypothesis_check_invalid": ("error", "a hypothesis was checked by another version's memo or by a memo not "
                                  "later than the one that proposed it",
         """SELECT hc.hypothesis_id || ' ' || hc.memo_id FROM hypothesis_checks hc

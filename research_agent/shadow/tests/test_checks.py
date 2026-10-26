@@ -119,3 +119,13 @@ def test_decision_using_a_future_memo(con):
     add_run(con)
     add_decision(con, memo_id="M2")  # M2's cycle date is 10-26, after the 09-11 trade
     assert flagged(con)["decision_memo_from_future"].examples == ["D9"]
+
+
+def test_cycle_without_a_valid_memo_is_flagged(con):
+    rows = [{"attempt_id": f"att_{day}", "calibration_run_id": f"cal_{day}", "experiment_version": "llm_stats",
+             "cycle_date": day, "attempt_no": 1, "created_at": f"{day}T20:00:00+00:00", "model": "fake",
+             "status": "invalid", "safety_passed": False} for day in ("2026-08-31", "2026-09-28")]
+    append_rows(con, "calibration_attempts", rows)
+    found = flagged(con)["cycle_without_valid_memo"]
+    assert found.severity == "warning"
+    assert found.examples == ["llm_stats 2026-09-28"]      # 08-31 has memo M1 in the fake data
