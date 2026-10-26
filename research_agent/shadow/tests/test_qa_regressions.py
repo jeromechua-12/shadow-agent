@@ -20,10 +20,6 @@ def test_trade_date_filter_rejects_non_string_bounds_as_value_error(value):
         build_filters({"trade_date": {"min": value}})
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="--max-runs counts ticker/date pairs, not underlying model attempts (README review finding 11)",
-)
 def test_max_runs_caps_model_attempts_including_token_cap_retry(tmp_path, monkeypatch):
     monkeypatch.setenv("SHADOW_UPSTREAM_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setattr(cache_runner, "STAGGER_S", 0)
@@ -54,4 +50,7 @@ def test_max_runs_caps_model_attempts_including_token_cap_retry(tmp_path, monkey
     ])
 
     assert result == 0
-    assert len(calls) <= 1
+    assert len(calls) == 1
+    saved = cache_runner.read_cache("NVDA", "2026-09-01")
+    assert not saved["complete"]
+    assert "max-runs budget exhausted before token-cap retry" in saved["incomplete_reasons"]

@@ -70,8 +70,9 @@ def test_parallel_workers_retry_rate_limits(cache_dir, monkeypatch):
 
     monkeypatch.setattr(cache_runner, "run_upstream", fake_run)
     rc = cache_runner.main(["--tickers", "NVDA", "AAPL", "MSFT", "--dates", "2026-09-01",
-                            "--max-runs", "3", "--workers", "2"])
+                            "--max-runs", "4", "--workers", "2"])
     assert rc == 0
+    assert len(attempts) == 4
     assert attempts.count(("AAPL", "2026-09-01")) == 2
     for t in ("NVDA", "AAPL", "MSFT"):
         assert cache_runner.read_cache(t, "2026-09-01")["complete"]
@@ -94,12 +95,36 @@ def test_loop_at_token_cap_retries_once_at_higher_temperature(cache_dir, monkeyp
     calls = []
     monkeypatch.setattr(cache_runner, "run_upstream", looped_or_ok(calls))
     monkeypatch.setattr(cache_runner, "openrouter_spend", lambda: None)
-    assert cache_runner.main(["--tickers", "NVDA", "--dates", "2026-09-02"]) == 0
+    assert cache_runner.main(["--tickers", "NVDA", "--dates", "2026-09-02", "--max-runs", "2"]) == 0
     assert calls == [0.2, 0.6]
     saved = cache_runner.read_cache("NVDA", "2026-09-02")
     assert saved["complete"] and saved["model"]["temperature"] == 0.6
     assert saved["retry_of"]["run_id"] == "t0.2" and "Fundamentals Analyst" in saved["retry_of"]["reason"]
     assert (cache_dir / "NVDA" / "_superseded" / "2026-09-02.t0.2.json").exists()
+
+
+def test_attempt_budget_reserves_one_start_for_each_pair(cache_dir, monkeypatch):
+    monkeypatch.setattr(cache_runner, "RATE_LIMIT_BASE_DELAY_S", 0)
+    monkeypatch.setattr(cache_runner, "STAGGER_S", 0)
+    monkeypatch.setattr(cache_runner, "openrouter_spend", lambda: None)
+    attempts = []
+
+    def fake_run(ticker, date, temperature=0.2):
+        attempts.append(ticker)
+        if ticker == "NVDA":
+            raise RuntimeError("Error code: 429 - rate limited")
+        return {"run_id": "msft", "complete": True, "incomplete_reasons": [],
+                "model": {"temperature": temperature}, "duration_s": 0, "usage": {}}
+
+    monkeypatch.setattr(cache_runner, "run_upstream", fake_run)
+    rc = cache_runner.main(["--tickers", "NVDA", "MSFT", "--dates", "2026-09-01",
+                            "--max-runs", "3", "--workers", "1"])
+
+    assert rc == 1
+    assert attempts == ["NVDA", "NVDA", "MSFT"]
+    assert cache_runner.read_cache("MSFT", "2026-09-01")["complete"]
+    failed = list((cache_dir / "NVDA" / "_failed").glob("*.json"))
+    assert "budget exhausted" in failed[0].read_text()
 
 
 def test_rerun_of_a_looped_pair_starts_hot(cache_dir, monkeypatch):
@@ -126,4 +151,4 @@ def test_rerun_flag_and_sample_cache(cache_dir, tmp_path, monkeypatch, capsys):
 def test_refuses_more_runs_than_allowed(cache_dir, capsys):
     rc = cache_runner.main(["--tickers", "NVDA", "AAPL", "--dates", "2026-09-01"])
     assert rc == 2
-    assert "refusing: 2 runs planned" in capsys.readouterr().out
+    assert "2 ticker/date pairs need one attempt each" in capsys.readouterr().out
