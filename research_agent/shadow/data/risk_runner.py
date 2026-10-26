@@ -5,8 +5,10 @@ For each cached trading date, in order:
    both ``feedback`` books up to the date, and run one calibration cycle. This
    comes before the day's trades, since a memo applies from its own cycle date.
 2. Per setup: advance the decision book, then run the risk debate + PM on every
-   Buy/Sell proposal and log the decision. Holds are skipped.
-At the end both books of both setups are advanced to the last date.
+   Buy/Sell proposal and log the decision. Holds are skipped. A PM whose output
+   cannot be parsed is run once more; if it fails again the trade is logged as Hold.
+At the end both books of both setups are advanced to the last date, and every
+outcome whose 10 trading days have passed by today is scored.
 
 Upstream's graph is reused from the Trader onward (``update_state(as_node="Trader")``)
 with its SQLite checkpointer, so a stopped run resumes where it was. The memory
@@ -23,6 +25,7 @@ import bisect
 import json
 import logging
 from datetime import date
+from pathlib import Path
 
 from shadow.data import evidence
 from shadow.data.cache_runner import REPORT_KEYS, UsageCounter, openrouter_spend, read_cache, spend_since
@@ -42,6 +45,8 @@ logger = logging.getLogger(__name__)
 VERSIONS = ("original", "feedback")
 FEEDBACK = "feedback"
 CYCLE_DAYS = 20
+PM_ATTEMPTS = 2   # a PM output that cannot be parsed is retried once, then logged as Hold
+UNPARSED_NOTE = "PM output unparseable after one retry; recorded as Hold."
 #: Final size per Trader action and PM rating (proposed size is always 1.0); any other rating rejects.
 FINAL_SIZE = {"Buy": {"Buy": 1.0, "Overweight": 0.5}, "Sell": {"Sell": 1.0, "Underweight": 0.5}}
 
@@ -89,15 +94,24 @@ def portfolio_block(con, version: str, ticker: str, day: date) -> str:
     return f"{book.render(ticker)}\n- Drawdown from peak: {drawdown:.1%}"
 
 
-def run_pair(graph, checkpoint_dir, run_id: str, ticker: str, day: date, version: str,
-             portfolio: str, memo: dict | None) -> tuple[dict | None, dict]:
+def load_cache(con, run_id: str, ticker: str, day: date) -> dict:
+    """The run's upstream cache file: the path the database recorded, else the real cache folder."""
+    row = con.execute("SELECT cache_file FROM runs WHERE run_id = ?", [run_id]).fetchone()
+    path = Path(row[0]) if row and row[0] else None
+    cache = (json.loads(path.read_text(encoding="utf-8")) if path and path.exists()
+             else read_cache(ticker, day.isoformat()))
+    if cache is None or cache["run_id"] != run_id:
+        raise RuntimeError(f"cache file for {ticker} {day} is missing or not current run {run_id}")
+    return cache
+
+
+def run_pair(graph, checkpoint_dir, cache: dict, ticker: str, day: date, version: str,
+             portfolio: str, memo: dict | None, attempt: int = 1) -> tuple[dict | None, dict]:
     """Risk debate + PM on one cached proposal; returns (PM fields, final state).
 
     PM fields are None when the PM fell back to free text, or the thread had already finished.
+    Each attempt has its own checkpoint thread, so a retry runs the risk stage afresh.
     """
-    cache = read_cache(ticker, day.isoformat())
-    if cache is None or cache["run_id"] != run_id:
-        raise RuntimeError(f"cache file for {ticker} {day} is missing or not current run {run_id}")
     outputs = cache["outputs"]
     state = graph.propagator.create_initial_state(
         ticker, day.isoformat(), instrument_context=outputs["instrument_context"], portfolio_context=portfolio,
@@ -107,6 +121,8 @@ def run_pair(graph, checkpoint_dir, run_id: str, ticker: str, day: date, version
 
     args = graph.propagator.get_graph_args()
     signature = f"risk|{version}|memo={memo['memo_id'] if memo else 'none'}"
+    if attempt > 1:
+        signature += f"|attempt={attempt}"
     args["config"]["configurable"] = {"thread_id": thread_id(ticker, day.isoformat(), signature)}
     with get_checkpointer(checkpoint_dir, ticker) as saver, evidence.capture() as rec:
         app = graph.workflow.compile(checkpointer=saver)
@@ -132,7 +148,7 @@ def run(db_path, graph, *, tickers=None, through: date | None = None, cycle_days
     checkpoint_dir = checkpoint_dir or warehouse_dir() / "risk_runner"
     sim = {"calendar": days, "price_provider": price_provider}
     evidence.install()
-    done = {"decisions": 0, "no_decision": 0, "cycles": 0}
+    done = {"decisions": 0, "pm_retries": 0, "pm_fallback_holds": 0, "cycles": 0, "outcomes_scored": 0}
 
     con = connect(db_path)
     try:
@@ -142,7 +158,8 @@ def run(db_path, graph, *, tickers=None, through: date | None = None, cycle_days
             i = bisect.bisect_left(days, day)
             before = days[i - 1] if i else None
             if day in cycles and not calibrated(con, day):
-                score_pending_decisions(con, today=day, calendar=days, price_provider=price_provider)
+                done["outcomes_scored"] += score_pending_decisions(
+                    con, today=day, calendar=days, price_provider=price_provider).scored
                 for book in ("decision", "shadow"):
                     advance(con, experiment_version=FEEDBACK, book=book, to_date=day, decisions_through=before, **sim)
                 # The calibration runner opens its own connections to the same file.
@@ -156,10 +173,25 @@ def run(db_path, graph, *, tickers=None, through: date | None = None, cycle_days
                 memo = current_memo(con, day, FEEDBACK) if version == FEEDBACK else None
                 for run_id, ticker, action in pending_pairs(con, version, day, tickers):
                     portfolio = portfolio_block(con, version, ticker, day)
-                    fields, final = run_pair(graph, checkpoint_dir, run_id, ticker, day, version, portfolio, memo)
+                    cache = load_cache(con, run_id, ticker, day)
+                    for attempt in range(1, PM_ATTEMPTS + 1):
+                        fields, final = run_pair(graph, checkpoint_dir, cache, ticker, day, version,
+                                                 portfolio, memo, attempt)
+                        if fields is not None:
+                            break
+                        if attempt < PM_ATTEMPTS:
+                            logger.warning("%s %s %s: no structured PM decision; retrying once", version, ticker, day)
+                            done["pm_retries"] += 1
                     if fields is None:
-                        logger.warning("%s %s %s: no structured PM decision; nothing logged", version, ticker, day)
-                        done["no_decision"] += 1
+                        # The protocol: retry once, then record Hold. Ratings stay NULL (none were given).
+                        logger.warning("%s %s %s: PM still unparseable; recording Hold", version, ticker, day)
+                        text = final.get("final_trade_decision") or ""
+                        insert_decision(con, run_id=run_id, experiment_version=version, verdict="rejected",
+                                        proposed_size=1.0, final_size=0.0, risk_ratings=None, main_reason="none",
+                                        explanation=f"{UNPARSED_NOTE} {text}".strip(),
+                                        pm_rating="Hold", memo_id=final.get("risk_memo_id"))
+                        done["pm_fallback_holds"] += 1
+                        done["decisions"] += 1
                         continue
                     size, verdict, rating = sized_decision(action, fields["rating"])
                     insert_decision(con, run_id=run_id, experiment_version=version, verdict=verdict,
@@ -173,6 +205,10 @@ def run(db_path, graph, *, tickers=None, through: date | None = None, cycle_days
                 for book in ("decision", "shadow"):
                     advance(con, experiment_version=version, book=book, to_date=dates[-1],
                             decisions_through=dates[-1], **sim)
+            # Outcomes are otherwise scored only on cycle dates; score all that are due by
+            # today so the evaluation sees the last ~10 trading days too.
+            done["outcomes_scored"] += score_pending_decisions(
+                con, calendar=days, price_provider=price_provider).scored
     finally:
         con.close()
     return done

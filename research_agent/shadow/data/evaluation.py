@@ -16,6 +16,7 @@ import argparse
 import json
 import math
 from collections.abc import Callable
+from datetime import date
 
 import duckdb
 import numpy as np
@@ -23,6 +24,7 @@ import pandas as pd
 from scipy.stats import wilcoxon
 
 from shadow.data.risk_runner import VERSIONS
+from shadow.data.writers import InvalidRecord, outcome_dates
 from shadow.sim.config import DEFAULT, SimConfig
 
 PriceProvider = Callable[[str, str], pd.DataFrame]  # (ticker, as_of) -> OHLCV rows up to as_of
@@ -125,6 +127,27 @@ def decision_quality(con: duckdb.DuckDBPyConnection, version: str) -> dict:
     }
 
 
+def unscored_due(con: duckdb.DuckDBPyConnection, price_provider: PriceProvider, through: date) -> list[str]:
+    """Decisions of the compared versions whose outcome was due by ``through`` but has no row."""
+    df = price_provider("SPY", through.isoformat())
+    calendar = sorted({date.fromisoformat(d) for d in df["Date"].astype(str).str[:10]})
+    placeholders = ", ".join("?" for _ in VERSIONS)
+    rows = con.execute(f"""
+        SELECT d.decision_id, d.trade_date FROM decisions d
+        LEFT JOIN outcomes o USING (decision_id)
+        WHERE o.decision_id IS NULL AND d.experiment_version IN ({placeholders})
+        ORDER BY d.trade_date, d.decision_id""", list(VERSIONS)).fetchall()
+    due = []
+    for decision_id, trade_date in rows:
+        try:
+            _, resolved = outcome_dates(trade_date, calendar)
+        except InvalidRecord:
+            continue   # no trading day after it in the price history: not due
+        if resolved is not None and resolved <= through:
+            due.append(decision_id)
+    return due
+
+
 def evaluate(con: duckdb.DuckDBPyConnection, price_provider: PriceProvider | None = None,
              n_boot: int = N_BOOT) -> dict:
     """Score every setup on the dates all runner versions have a decision-book snapshot."""
@@ -134,6 +157,10 @@ def evaluate(con: duckdb.DuckDBPyConnection, price_provider: PriceProvider | Non
     if price_provider is None:
         from tradingagents.dataflows.vendors.yahoo.ohlcv import load_ohlcv
         price_provider = lambda t, as_of: load_ohlcv(t, as_of, fill_gaps=False)  # noqa: E731
+    unscored = unscored_due(con, price_provider, values.index[-1].date())
+    if unscored:
+        raise ValueError(f"{len(unscored)} decision(s) are due but not scored (e.g. {unscored[:3]}); "
+                         "run python -m shadow.data.outcome_judge first")
     values[SPY] = spy_values(values.index, price_provider)
     rf = risk_free_weekly(values.index, price_provider)
 

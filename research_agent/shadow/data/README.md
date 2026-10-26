@@ -228,16 +228,16 @@ There is no stand-in simulator, so `books` is empty there.
 
 ## 6. Run one Calibration Agent cycle
 
-The runner makes three serial OpenRouter attempts and stores each attempt, its tool calls,
-validation results and evidence score. If at least one attempt passes hard checks, it saves one
-final memo. If none passes, it saves the attempts and produces no memo.
+The runner makes one OpenRouter attempt per cycle (the evaluation protocol calibrates once per
+point) and stores it with its tool calls, validation results and evidence score. If it passes the
+hard checks, it saves the memo; if not, it saves the attempt and produces no memo.
 
 ```powershell
 python -m shadow.data.calibration_runner --as-of 2026-09-28 --experiment-version llm_stats --dev
 ```
 
 The model ID, temperature and token limit are pinned in `calibration_agent.py`. This command
-calls the LLM three times and may incur API cost; use the dev database for a controlled trial.
+calls the LLM once and incurs API cost; use the dev database for a controlled trial.
 The agent's tools are bound to the requested date and version and expose no database writes.
 
 Review the final memo in `memos` / `memo_advice`; inspect every model attempt in
@@ -273,6 +273,22 @@ python -m shadow.data.memo_report --experiment-version stats_dev --dev --json
 
 Omit `--cycle-date` to show the latest memo for that experiment. Use `--db PATH` instead of
 `--dev` to select another database.
+
+## 8. Replay the risk stage, then evaluate
+
+```powershell
+python -m shadow.data.risk_runner --dev --tickers NVDA --through 2026-09-01 --dry-run
+python -m shadow.data.evaluation --dev
+```
+
+The risk runner replays each cached Buy/Sell proposal through the risk debate and Portfolio
+Manager for `original` and `feedback`, logs the decision, and runs a calibration cycle every 20
+cached dates. It reads each run's cache file from `runs.cache_file`, so `--dev` uses the sample
+cache. If the PM's output cannot be parsed it runs the pair once more; if it fails again the trade
+is logged as Hold (`verdict` rejected, `pm_rating` Hold, risk ratings NULL, explanation starting
+"PM output unparseable after one retry"). At the end it scores every outcome due by today.
+The evaluation refuses to run while any decision whose 10 trading days have passed has no
+outcome; run `python -m shadow.data.outcome_judge` if that happens.
 
 
 ## Rules

@@ -428,8 +428,11 @@ def test_16_alpaca_vendor_clamps_to_the_analysis_date(tmp_path, monkeypatch):
     days = [date(2026, 8, 25) + timedelta(days=i) for i in range(12)]
     store._append("NVDA", [_article(i, f"{d}T15:00:00Z") for i, d in enumerate(days)])
     store._append("_global", [_article(100 + i, f"{d}T15:00:00Z") for i, d in enumerate(days)])
+    # Mark every day any call below may ask for as downloaded (the clamped global window
+    # starts 08-21), so the vendor never reaches the Alpaca API from a test.
+    covered = [date(2026, 8, 15) + timedelta(days=i) for i in range(25)]
     for key in ("NVDA", "_global"):
-        store._mark_covered(key, None, days)
+        store._mark_covered(key, None, covered)
     monkeypatch.setattr(alpaca_news, "default_store", lambda: store)
 
     with alpaca_news.analysis_date("2026-08-28"):

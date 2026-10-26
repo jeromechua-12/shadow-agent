@@ -1,4 +1,4 @@
-"""Run a three-attempt, auditable Calibration Agent cycle."""
+"""Run one auditable Calibration Agent cycle (one model attempt, stored with its checks)."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from shadow.data.db import check_schema_version, connect, init_db, resolve_db
 from shadow.data.queries import CalibrationTools
 from shadow.data.writers import insert_calibration_attempts, insert_memo
 
-ATTEMPT_COUNT = 3
+ATTEMPT_COUNT = 1   # the evaluation protocol runs calibration once per point
 
 
 def _now() -> str:
@@ -129,7 +129,7 @@ def _hypothesis_checks(output, tool_calls: list[dict]) -> list[dict]:
 
 def run_cycle(*, as_of: str, experiment_version: str, db_path=None,
               llm=None) -> dict:
-    """Run three serialized model attempts, then persist attempts and at most one memo."""
+    """Run ``ATTEMPT_COUNT`` model attempts, then persist every attempt and at most one memo."""
     cycle_date = date.fromisoformat(as_of)
     path = resolve_db(db_path, dev=False) if db_path else resolve_db(None, dev=False)
     # Apply the additive schema migration before opening a read-only connection.
@@ -222,7 +222,7 @@ def run_cycle(*, as_of: str, experiment_version: str, db_path=None,
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run one three-attempt Calibration Agent cycle.")
+    parser = argparse.ArgumentParser(description="Run one Calibration Agent cycle.")
     parser.add_argument("--as-of", required=True)
     parser.add_argument("--experiment-version", required=True)
     parser.add_argument("--db", help="DuckDB path; defaults to the main calibration database")

@@ -75,7 +75,7 @@ def label_for(part: str, score: float) -> str:
 
 def insert_decision(
     con: duckdb.DuckDBPyConnection, *, run_id: str, experiment_version: str, verdict: str,
-    proposed_size: float, final_size: float, risk_ratings: dict, main_reason: str,
+    proposed_size: float, final_size: float, risk_ratings: dict | None, main_reason: str,
     explanation: str = "", pm_rating: str | None = None, memo_id: str | None = None,
     decided_at: str | None = None,
 ) -> list[str]:
@@ -86,7 +86,8 @@ def insert_decision(
     and direction come from the run itself. Returns the new decision_ids.
 
     risk_ratings: {"volatility": 0-3, "event_risk": 0-3, "valuation": 0-3,
-                   "liquidity": 0-3, "concentration": 0-3}
+                   "liquidity": 0-3, "concentration": 0-3}, or None only for a PM whose
+                   output could not be parsed and is recorded as Hold (ratings stay NULL).
     """
     problems: list[str] = []
     run = con.execute("SELECT r.ticker, r.trade_date, p.action FROM runs r "
@@ -129,7 +130,11 @@ def insert_decision(
             problems.append(f"verdict {verdict!r} does not match sizes {proposed_size} -> {final_size} "
                             f"(that is {expected!r})")
     ratings = risk_ratings if isinstance(risk_ratings, dict) else {}
-    if set(ratings) != set(CATEGORIES):
+    if risk_ratings is None:
+        if not (pm_rating == "Hold" and _is_number(final_size) and final_size == 0):
+            problems.append("risk_ratings may be omitted only for an unparsed PM recorded as Hold "
+                            "(pm_rating 'Hold', final_size 0)")
+    elif set(ratings) != set(CATEGORIES):
         problems.append(f"risk_ratings needs exactly these keys: {list(CATEGORIES)}; got {sorted(ratings)}")
     for cat, v in ratings.items():
         if cat in CATEGORIES and not (isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 3):
@@ -159,8 +164,26 @@ def insert_decision(
     if proposed_size - final_size > 1e-9:
         parts.append({**base, "decision_id": _new_id("dec"), "part": "rejected_part",
                       "part_size": float(proposed_size - final_size)})
-    append_rows(con, "decisions", parts)
+    # Both parts or neither: a crash between them must not leave half a decision.
+    own = _begin(con)
+    try:
+        append_rows(con, "decisions", parts)
+        if own:
+            con.commit()
+    except Exception:
+        if own:
+            con.rollback()
+        raise
     return [p["decision_id"] for p in parts]
+
+
+def _begin(con: duckdb.DuckDBPyConnection) -> bool:
+    """Start a transaction; False if the caller already has one open (theirs then covers us)."""
+    try:
+        con.begin()
+        return True
+    except duckdb.TransactionException:
+        return False
 
 
 # ---- outcomes --------------------------------------------------------------------
@@ -274,11 +297,12 @@ def insert_calibration_attempts(
         problems.append("experiment_version is required")
     if not calibration_run_id:
         problems.append("calibration_run_id is required")
-    if len(attempts) != 3:
-        problems.append(f"exactly three attempts are required, got {len(attempts)}")
+    if not attempts:
+        problems.append("at least one attempt is required")
     attempt_nos = [a.get("attempt_no") for a in attempts]
-    if sorted(attempt_nos) != [1, 2, 3]:
-        problems.append("attempt_no values must be exactly 1, 2 and 3")
+    numbers = sorted(n for n in attempt_nos if isinstance(n, int) and not isinstance(n, bool))
+    if len(numbers) != len(attempts) or numbers != list(range(1, len(attempts) + 1)):
+        problems.append(f"attempt_no values must be exactly 1..{len(attempts)}, got {attempt_nos}")
     for i, attempt in enumerate(attempts):
         if not attempt.get("attempt_id") or not attempt.get("model") or not attempt.get("status"):
             problems.append(f"attempts[{i}] needs attempt_id, model and status")

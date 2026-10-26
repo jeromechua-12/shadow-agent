@@ -153,3 +153,22 @@ def test_memo_problems_listed(con):
                     advice={"volatility": {"advice": "panic"}}, safety_passed=True,
                     tool_calls=[{"tool": "drop_table"}])
     assert len(e.value.problems) >= 6
+
+
+def test_two_part_decision_is_all_or_nothing(con, monkeypatch):
+    from shadow.data import writers
+
+    monkeypatch.setattr(writers, "_new_id", lambda prefix: "dec_same")  # second part collides with the first
+    with pytest.raises(Exception, match="(?i)constraint|duplicate"):
+        decision(con)                                                     # reduced: two parts
+    assert con.execute("SELECT count(*) FROM decisions").fetchone() == (0,)
+
+
+def test_unparsed_pm_hold_is_stored_without_ratings(con):
+    (d,) = decision(con, verdict="rejected", final_size=0.0, risk_ratings=None, main_reason="none",
+                    pm_rating="Hold", explanation="PM output unparseable after one retry; recorded as Hold.")
+    row = con.execute("SELECT part, risk_volatility, risk_event, pm_rating FROM decisions WHERE decision_id = ?",
+                      [d]).fetchone()
+    assert row == ("rejected_part", None, None, "Hold")
+    with pytest.raises(InvalidRecord, match="risk_ratings may be omitted only"):
+        decision(con, risk_ratings=None, experiment_version="v2")         # a real (reduced) decision needs ratings

@@ -22,7 +22,7 @@ from tradingagents.agents import schemas
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph import trading_graph
 
-DAYS = [date(2026, 9, 1) + timedelta(days=i) for i in range(12)]
+DAYS = [date(2026, 9, 1) + timedelta(days=i) for i in range(30)]
 CACHED = DAYS[1:6]                       # five cached dates; cycle_days=2 -> cycles on CACHED[2], CACHED[4]
 PROPOSALS = {"NVDA": "Buy", "AAPL": "Sell", "MSFT": "Hold"}
 
@@ -31,6 +31,7 @@ class FakeModel(BaseChatModel):
     """Answers the debaters with text; the PM's structured call returns ``decision`` or fails."""
 
     decision: schemas.PortfolioDecision | None = None
+    fail_structured: int = 0             # fail this many structured calls first, then answer
     calls: list = Field(default_factory=list)
 
     @property
@@ -40,7 +41,8 @@ class FakeModel(BaseChatModel):
     def with_structured_output(self, schema, **kwargs):
         def answer(prompt):
             self.calls.append(prompt)
-            if self.decision is None:
+            if self.decision is None or self.fail_structured > 0:
+                self.fail_structured -= 1
                 raise ValueError("no structured output")
             return self.decision
         return RunnableLambda(answer)
@@ -90,9 +92,13 @@ def _fake_calibration(cycles):
     return calibrate
 
 
-@pytest.fixture
-def setup(tmp_path, monkeypatch):
-    """A DuckDB with three tickers on five cached dates, and their cache files."""
+def _build(tmp_path, monkeypatch, cache_in_db: bool = False):
+    """A DuckDB with three tickers on five cached dates, and their cache files.
+
+    ``cache_in_db``: files live in a sample folder named only by ``runs.cache_file``
+    (as in dev.duckdb); the real cache folder is empty.
+    """
+    folder = tmp_path / ("sample" if cache_in_db else "upstream")
     monkeypatch.setenv("SHADOW_UPSTREAM_CACHE_DIR", str(tmp_path / "upstream"))
     path = tmp_path / "test.duckdb"
     init_db(path).close()
@@ -101,12 +107,13 @@ def setup(tmp_path, monkeypatch):
     for day in CACHED:
         for ticker, action in PROPOSALS.items():
             run_id = f"{ticker}_{day}"
+            cache = folder / ticker / f"{day}.json"
             runs.append({"run_id": run_id, "ticker": ticker, "trade_date": day,
-                         "started_at": "2026-10-22T10:00:00+00:00", "cache_version": 1, "complete": True})
+                         "started_at": "2026-10-22T10:00:00+00:00", "cache_version": 1, "complete": True,
+                         "cache_file": str(cache) if cache_in_db else None})
             proposals.append({"run_id": run_id, "ticker": ticker, "trade_date": day, "action": action,
                               "direction": {"Buy": 1, "Hold": 0, "Sell": -1}[action], "reasoning": "r",
                               "structured_ok": True})
-            cache = tmp_path / "upstream" / ticker / f"{day}.json"
             cache.parent.mkdir(parents=True, exist_ok=True)
             cache.write_text(json.dumps({
                 "run_id": run_id,
@@ -120,6 +127,11 @@ def setup(tmp_path, monkeypatch):
     append_rows(con, "trader_proposals", proposals)
     con.close()
     return path
+
+
+@pytest.fixture
+def setup(tmp_path, monkeypatch):
+    return _build(tmp_path, monkeypatch)
 
 
 def _run(path, graph, tmp_path, cycles, **kw):
@@ -157,7 +169,8 @@ def test_a_full_replay_logs_both_setups_and_feeds_the_memo_to_feedback_only(setu
     done = _run(setup, _graph(tmp_path, monkeypatch, model), tmp_path, cycles)
 
     assert cycles == [CACHED[2].isoformat(), CACHED[4].isoformat()]
-    assert done == {"decisions": 2 * 2 * len(CACHED), "no_decision": 0, "cycles": 2}
+    assert done == {"decisions": 2 * 2 * len(CACHED), "pm_retries": 0, "pm_fallback_holds": 0, "cycles": 2,
+                    "outcomes_scored": 3 * 2 * len(CACHED)}   # per day and setup: reduced Buy = 2 parts, Sell = 1
     con = connect(setup, read_only=True)
     rows = con.execute("SELECT experiment_version, ticker, trade_date, verdict, pm_rating, memo_id, risk_volatility, "
                        "risk_concentration, main_reason FROM decisions ORDER BY 1, 3, 2").fetchall()
@@ -192,18 +205,54 @@ def test_the_risk_team_sees_the_memo_and_the_decision_book_with_drawdown(setup, 
 
 
 @pytest.mark.unit
-def test_a_free_text_pm_logs_nothing_and_a_restart_reruns_nothing(setup, tmp_path, monkeypatch):
+def test_a_free_text_pm_is_retried_once_then_recorded_as_hold(setup, tmp_path, monkeypatch):
     model = FakeModel(decision=None)
     graph = _graph(tmp_path, monkeypatch, model)
     done = _run(setup, graph, tmp_path, [], through=CACHED[0])
-    assert done == {"decisions": 0, "no_decision": 4, "cycles": 0}
-    calls = len(model.calls)
+    assert (done["decisions"], done["pm_retries"], done["pm_fallback_holds"]) == (4, 4, 4)
+    structured = [c for c in model.calls if isinstance(c, str)]
+    assert len(structured) == 2 * 4                                     # two PM attempts per pair
     con = connect(setup, read_only=True)
-    assert con.execute("SELECT count(*) FROM decisions").fetchone()[0] == 0
+    rows = con.execute("SELECT verdict, pm_rating, final_size, risk_volatility, risk_concentration, main_reason, "
+                       "explanation FROM decisions").fetchall()
+    con.close()
+    assert len(rows) == 4
+    for verdict, rating, final, vol, conc, reason, explanation in rows:
+        assert (verdict, rating, final, vol, conc, reason) == ("rejected", "Hold", 0.0, None, None, "none")
+        assert explanation.startswith("PM output unparseable after one retry; recorded as Hold.")
+
+    calls = len(model.calls)
+    again = _run(setup, graph, tmp_path, [], through=CACHED[0])
+    assert again["decisions"] == 0 and len(model.calls) == calls        # logged pairs are not re-run
+
+
+@pytest.mark.unit
+def test_a_pm_that_parses_on_the_retry_is_logged_normally(setup, tmp_path, monkeypatch):
+    model = FakeModel(decision=_decision("Buy"), fail_structured=1)
+    done = _run(setup, _graph(tmp_path, monkeypatch, model), tmp_path, [], through=CACHED[0])
+    assert (done["decisions"], done["pm_retries"], done["pm_fallback_holds"]) == (4, 1, 0)
+    con = connect(setup, read_only=True)
+    assert con.execute("SELECT count(*) FROM decisions WHERE risk_volatility IS NULL").fetchone()[0] == 0
     con.close()
 
-    again = _run(setup, graph, tmp_path, [], through=CACHED[0])
-    assert again["decisions"] == 0 and len(model.calls) == calls        # finished threads are not re-run
+
+@pytest.mark.unit
+def test_cache_files_are_found_through_runs_cache_file(tmp_path, monkeypatch):
+    path = _build(tmp_path, monkeypatch, cache_in_db=True)              # like dev.duckdb + sample cache
+    model = FakeModel(decision=_decision("Buy"))
+    done = _run(path, _graph(tmp_path, monkeypatch, model), tmp_path, [], through=CACHED[0])
+    assert done["decisions"] == 4
+
+
+@pytest.mark.unit
+def test_outcomes_due_by_today_are_scored_at_the_end(setup, tmp_path, monkeypatch):
+    model = FakeModel(decision=_decision("Buy"))
+    done = _run(setup, _graph(tmp_path, monkeypatch, model), tmp_path, [], through=CACHED[1])
+    con = connect(setup, read_only=True)
+    unscored = con.execute("SELECT count(*) FROM decisions d LEFT JOIN outcomes o USING (decision_id) "
+                           "WHERE o.decision_id IS NULL").fetchone()[0]
+    con.close()
+    assert done["outcomes_scored"] == done["decisions"] == 8 and unscored == 0
 
 
 @pytest.mark.unit

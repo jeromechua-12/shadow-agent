@@ -145,3 +145,25 @@ def test_evaluate_scores_all_three_setups(con):
 def test_evaluate_needs_shared_snapshots(tmp_path):
     with pytest.raises(ValueError, match="shared snapshot dates"):
         evaluation.evaluate(init_db(tmp_path / "empty.duckdb"), price_provider=_spy)
+
+
+def test_evaluate_refuses_while_resolvable_decisions_are_unscored(con):
+    append_rows(con, "decisions", [{
+        "decision_id": "late", "run_id": "rA", "experiment_version": "original", "ticker": "NVDA",
+        "trade_date": "2026-09-08", "decided_at": "2026-09-08T20:00:00+00:00", "part": "approved_part",
+        "verdict": "approved", "proposed_action": "Buy", "direction": 1, "proposed_size": 1.0,
+        "final_size": 1.0, "part_size": 1.0, "pm_rating": "Buy"}])
+    with pytest.raises(ValueError, match="1 decision.*not scored.*outcome_judge"):
+        evaluation.evaluate(con, price_provider=_spy, n_boot=200)
+
+
+def test_evaluate_allows_decisions_not_yet_resolvable(con):
+    last = DAYS[-3].date().isoformat()     # its 10 trading days run past the price history
+    append_rows(con, "runs", [{"run_id": "rZ", "ticker": "PG", "trade_date": last,
+                               "started_at": "2026-10-22T10:00:00+00:00", "cache_version": 1, "complete": True}])
+    append_rows(con, "decisions", [{
+        "decision_id": "fresh", "run_id": "rZ", "experiment_version": "original", "ticker": "PG",
+        "trade_date": last, "decided_at": f"{last}T20:00:00+00:00", "part": "approved_part",
+        "verdict": "approved", "proposed_action": "Buy", "direction": 1, "proposed_size": 1.0,
+        "final_size": 1.0, "part_size": 1.0, "pm_rating": "Buy"}])
+    assert evaluation.evaluate(con, price_provider=_spy, n_boot=200)["setups"]
