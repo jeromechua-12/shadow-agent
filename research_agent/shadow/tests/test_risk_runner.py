@@ -279,6 +279,36 @@ def test_a_missing_price_stops_the_run(setup, tmp_path, monkeypatch):
 
 
 @pytest.mark.unit
+def test_rendered_pm_text_reads_back_and_free_text_does_not():
+    found = risk_runner.RENDERED_PM.match(schemas.render_pm_decision(_decision("Overweight")))
+    assert found.groups() == ("Overweight", "2", "1", "0", "0", "3", "volatility")
+    assert risk_runner.RENDERED_PM.match("**Rating**: Hold\n\nargument") is None
+
+
+@pytest.mark.unit
+def test_a_pm_that_finished_before_a_crash_is_logged_without_rerunning(setup, tmp_path, monkeypatch):
+    model = FakeModel(decision=_decision("Buy"))
+    graph = _graph(tmp_path, monkeypatch, model)
+    real_insert = risk_runner.insert_decision
+
+    def crash(*args, **kwargs):
+        raise KeyboardInterrupt                                      # stopped after the PM, before logging
+
+    monkeypatch.setattr(risk_runner, "insert_decision", crash)
+    with pytest.raises(KeyboardInterrupt):
+        _run(setup, graph, tmp_path, [], through=CACHED[0])
+    monkeypatch.setattr(risk_runner, "insert_decision", real_insert)
+    pm_calls = sum(isinstance(c, str) for c in model.calls)
+
+    done = _run(setup, graph, tmp_path, [], through=CACHED[0])
+    assert (done["decisions"], done["pm_retries"], done["pm_fallback_holds"]) == (4, 0, 0)
+    assert sum(isinstance(c, str) for c in model.calls) - pm_calls == 3   # only the 3 pairs never run
+    con = connect(setup, read_only=True)
+    assert con.execute("SELECT count(*) FROM decisions WHERE risk_volatility IS NULL").fetchone()[0] == 0
+    con.close()
+
+
+@pytest.mark.unit
 def test_a_restart_skips_logged_decisions(setup, tmp_path, monkeypatch):
     model = FakeModel(decision=_decision("Buy"))
     graph = _graph(tmp_path, monkeypatch, model)

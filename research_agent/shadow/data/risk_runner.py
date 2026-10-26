@@ -29,6 +29,7 @@ import argparse
 import bisect
 import json
 import logging
+import re
 from datetime import date
 from pathlib import Path
 
@@ -54,6 +55,11 @@ PM_ATTEMPTS = 2   # a PM output that cannot be parsed is retried once, then logg
 UNPARSED_NOTE = "PM output unparseable after one retry; recorded as Hold."
 #: Final size per Trader action and PM rating (proposed size is always 1.0); any other rating rejects.
 FINAL_SIZE = {"Buy": {"Buy": 1.0, "Overweight": 0.5}, "Sell": {"Sell": 1.0, "Underweight": 0.5}}
+#: The head of ``render_pm_decision``'s text; a free-text PM never writes the risk-ratings line.
+RENDERED_PM = re.compile(
+    r"\*\*Rating\*\*: (Buy|Overweight|Hold|Underweight|Sell)\s*\n\s*\*\*Risk Ratings \(0-3\)\*\*: "
+    r"volatility ([0-3]), event risk ([0-3]), valuation ([0-3]), liquidity ([0-3]), concentration ([0-3]); "
+    r"main reason: (volatility|event_risk|valuation|liquidity|concentration|none)\s*$", re.MULTILINE)
 
 
 def schedule(con, through: date | None = None, cycle_days: int = CYCLE_DAYS) -> tuple[list[date], set[date]]:
@@ -127,7 +133,8 @@ def run_pair(graph, checkpoint_dir, cache: dict, ticker: str, day: date, version
              portfolio: str, memo: dict | None, attempt: int = 1) -> tuple[dict | None, dict]:
     """Risk debate + PM on one cached proposal; returns (PM fields, final state).
 
-    PM fields are None when the PM fell back to free text, or the thread had already finished.
+    PM fields are None when the PM fell back to free text. A thread that already finished (the
+    run stopped before logging it) is not re-run; its fields are read back from the rendered PM text.
     Each attempt has its own checkpoint thread, so a retry runs the risk stage afresh.
     """
     outputs = cache["outputs"]
@@ -148,7 +155,12 @@ def run_pair(graph, checkpoint_dir, cache: dict, ticker: str, day: date, version
         if not snap.values:
             app.update_state(args["config"], state, as_node="Trader")
         elif not snap.next:
-            return None, snap.values
+            found = RENDERED_PM.match(snap.values.get("final_trade_decision") or "")
+            if found is None:
+                return None, snap.values
+            logger.info("%s %s %s: PM decision recovered from finished checkpoint", version, ticker, day)
+            return {"rating": found[1], **{c: int(v) for c, v in zip(CATEGORIES, found.groups()[1:6])},
+                    "main_reason": found[7]}, snap.values
         for _ in app.stream(None, **args):
             pass
         final = app.get_state(args["config"]).values
