@@ -226,3 +226,6 @@ __marimo__/
 upstream_cache/
 warehouse/
 *.duckdb
+
+# Claude Code worktrees and local state
+.claude/
