@@ -8,7 +8,7 @@ from tradingagents.default_config import DEFAULT_CONFIG
 
 # Bump when anything that changes cached outputs changes (prompts, vendors,
 # graph shape), so old and new cache files can be told apart.
-CACHE_VERSION = 1
+CACHE_VERSION = 2   # 2: Reddit and StockTwits dropped
 
 ANALYSTS = ("market", "social", "news", "fundamentals")
 

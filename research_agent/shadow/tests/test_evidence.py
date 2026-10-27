@@ -103,6 +103,23 @@ def test_social_403_is_blocked():
     assert any("403" in line for line in call["log"])
 
 
+@pytest.mark.parametrize("attr, source", [("fetch_reddit_posts", "reddit"),
+                                          ("fetch_stocktwits_messages", "stocktwits")])
+def test_dropped_social_source_is_not_called_and_not_retryable(monkeypatch, attr, source):
+    import tradingagents.agents.analysts.sentiment_analyst as sentiment
+    from tradingagents.dataflows.vendors import reddit, stocktwits
+
+    def no_network(*args, **kwargs):
+        raise AssertionError("a dropped source must not be fetched")
+    monkeypatch.setattr(reddit, "urlopen", no_network)
+    monkeypatch.setattr(stocktwits, "urlopen", no_network)
+    with evidence.capture() as rec:
+        out = getattr(sentiment, attr)("NVDA", start_date="2026-08-25", end_date="2026-09-01", screen=None)
+    call = rec.calls[0]
+    assert "dropped from the experiment" in out and "NVDA" in out
+    assert (call["method"], call["vendor"], call["status"], call["retryable"]) == (attr, source, "unavailable", False)
+
+
 def test_inert_without_capture(monkeypatch):
     monkeypatch.setitem(router.VENDOR_METHODS, "get_stock_data", {"yfinance": fake("rows")})
     with run_config({"data_vendors": {"core_stock_apis": "yfinance"}}):

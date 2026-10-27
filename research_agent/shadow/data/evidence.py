@@ -312,6 +312,16 @@ def _wrap_social(source: str, original):
     return fetch
 
 
+def _dropped(label: str, original):
+    """A social fetcher that never calls its source and returns a not-retryable placeholder."""
+    def fetch(ticker, *args, **kwargs):
+        return (f"<{label} unavailable: dropped from the experiment, it only serves recent items, "
+                f"so this is not an absence of discussion of {ticker}>")
+
+    fetch.__name__ = original.__name__
+    return fetch
+
+
 def _wrap_render(name: str, original):
     def render(obj):
         rec = _recorder.get()
@@ -362,8 +372,9 @@ def install() -> None:
         import tradingagents.agents.trader.trader as trader
 
         _hook(tools, "route_to_vendor", _wrap_route)
-        _hook(sentiment, "fetch_stocktwits_messages", lambda f: _wrap_social("stocktwits", f))
-        _hook(sentiment, "fetch_reddit_posts", lambda f: _wrap_social("reddit", f))
+        # Dropped by the group: both serve only recent items, so a past date gets a placeholder anyway.
+        _hook(sentiment, "fetch_stocktwits_messages", lambda f: _wrap_social("stocktwits", _dropped("StockTwits", f)))
+        _hook(sentiment, "fetch_reddit_posts", lambda f: _wrap_social("reddit", _dropped("Reddit", f)))
         _hook(sentiment, "render_sentiment_report", lambda f: _wrap_render("sentiment_report", f))
         _hook(research_manager, "render_research_plan", lambda f: _wrap_render("research_plan", f))
         _hook(trader, "render_trader_proposal", lambda f: _wrap_render("trader_proposal", f))
