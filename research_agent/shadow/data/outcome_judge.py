@@ -43,7 +43,8 @@ class ScoringReport:
 
 def _default_price_provider(ticker: str, as_of: str):
     from tradingagents.dataflows.vendors.yahoo.ohlcv import load_ohlcv
-    return load_ohlcv(ticker, as_of)
+    # Prices as reported, the same frame the simulator fills from: a gap is skipped, not filled.
+    return load_ohlcv(ticker, as_of, fill_gaps=False)
 
 
 def _pending_decisions(con: duckdb.DuckDBPyConnection, experiment_version: str | None):
@@ -59,8 +60,11 @@ def _pending_decisions(con: duckdb.DuckDBPyConnection, experiment_version: str |
 
 
 def _price_return(df, entry: date, exit_: date) -> float:
-    e, x = entry.isoformat(), exit_.isoformat()
-    return float(df.loc[x, "Close"] / df.loc[e, "Open"] - 1)
+    """Exit close over entry open, minus one; raises ValueError when either price is empty."""
+    entry_open, exit_close = float(df.loc[entry.isoformat(), "Open"]), float(df.loc[exit_.isoformat(), "Close"])
+    if not (entry_open > 0 and exit_close > 0):   # NaN fails too, as in the simulator
+        raise ValueError(f"empty price: open on {entry} is {entry_open}, close on {exit_} is {exit_close}")
+    return exit_close / entry_open - 1
 
 
 def score_pending_decisions(

@@ -137,6 +137,19 @@ def test_missing_price_row_is_skipped_not_crashed(con):
     assert con.execute("SELECT count(*) FROM outcomes").fetchone()[0] == 0
 
 
+def test_empty_price_cell_is_skipped_not_scored(con):
+    _insert_run(con, "r9", "TSLA", date(2026, 1, 9), "Buy")
+    decision_id = _approve(con, "r9")
+    entry, resolved = outcome_dates(date(2026, 1, 9), CALENDAR)
+    # The entry row exists but its open was never reported (fill_gaps=False leaves it NaN).
+    prices = {"TSLA": _price_df({entry: (float("nan"), 101.0), resolved: (float("nan"), 110.0)}),
+              "SPY": _price_df({entry: (400.0, None), resolved: (None, 404.0)})}
+    report = score_pending_decisions(con, calendar=CALENDAR, today=TODAY, price_provider=_fake_provider(prices))
+    assert (report.scored, report.errors) == (0, []) and len(report.skipped_no_price) == 1
+    assert decision_id in report.skipped_no_price[0]
+    assert con.execute("SELECT count(*) FROM outcomes").fetchone()[0] == 0
+
+
 def test_dry_run_writes_nothing(con):
     _insert_run(con, "r6", "NVDA", date(2026, 1, 5), "Buy")
     _approve(con, "r6")
