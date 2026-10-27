@@ -98,7 +98,8 @@ def _text_status(method: str, text: str) -> tuple[str, bool]:
     if head.startswith("NO_DATA_AVAILABLE"):
         return "no_data", False
     if head.startswith("DATA_UNAVAILABLE"):
-        return "unavailable", True
+        # FRED's 400 for a series ID the model made up (e.g. "wti"): a rerun gets the same answer.
+        return "unavailable", "series does not exist" not in low
     if method in _WITHHOLDING and "withheld" in low:
         return "withheld", False
     if head.startswith("<") and "unavailable" in low:

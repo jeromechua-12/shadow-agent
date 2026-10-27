@@ -37,6 +37,8 @@ def route(method, *args):
     ("get_stock_data", "Date,Open\n2026-09-01,1", "ok", False),
     ("get_stock_data", "NO_DATA_AVAILABLE: No usable market data for 'X'", "no_data", False),
     ("get_macro_indicators", "DATA_UNAVAILABLE: optional macro_data could not be retrieved", "unavailable", True),
+    ("get_macro_indicators", "DATA_UNAVAILABLE: optional macro_data could not be retrieved (FRED request failed: "
+     "Bad Request.  The series does not exist in ALFRED but may exist in FRED.", "unavailable", False),
     ("get_fundamentals", "# Company Fundamentals for NVDA\n\nProfile fundamentals are withheld for this date.", "withheld", False),
     ("get_news", "Headline: why shares were withheld from sale", "ok", False),  # 'withheld' in news text is just news
     ("fetch_reddit_posts", "<Reddit search unavailable for 2026-08-25..2026-09-01: it only serves recent items>", "unavailable", False),
