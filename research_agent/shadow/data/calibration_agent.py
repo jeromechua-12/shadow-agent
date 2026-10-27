@@ -19,7 +19,7 @@ from shadow.data.queries import CalibrationTools
 
 CALIBRATION_MODEL = "deepseek/deepseek-v4-flash-0731"
 CALIBRATION_TEMPERATURE = 0.2   # the protocol fixes every LLM at 0.2; 0.0 made DeepSeek loop upstream
-CALIBRATION_MAX_TOKENS = 16384
+CALIBRATION_MAX_TOKENS = 32768   # same cap as TRADINGAGENTS_MAX_TOKENS in .env
 MAX_TOOL_STEPS = 12
 RATE_LIMIT_RETRIES = 3
 API_ERROR_CODES = (401, 402, 403, 408, 429)   # key, credit, access, timeout, rate limit

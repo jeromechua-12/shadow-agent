@@ -205,7 +205,7 @@ bigger batches, and the runner prints the batch's cost at the end. Runs of one t
 never overlap, so `--workers` helps only with several tickers.
 
 Settings are pinned in [`settings.py`](settings.py): DeepSeek V4 Flash, temperature 0.2,
-16384 max tokens, one debate round, news from Alpaca, statements from SEC EDGAR first.
+32768 max tokens (`TRADINGAGENTS_MAX_TOKENS` in `.env`), one debate round, news from Alpaca, statements from SEC EDGAR first.
 
 A run is marked incomplete when a report or debate turn is empty, when the Trader's
 proposal came back as free text without numbers, or when a data source failed for a
