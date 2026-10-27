@@ -7,6 +7,7 @@ For each cached trading date, in order:
 2. Per setup: advance the decision book, then run the risk debate + PM on every
    Buy/Sell proposal and log the decision. Holds are skipped. A PM whose output
    cannot be parsed is run once more; if it fails again the trade is logged as Hold.
+   With ``--workers``, a day's tickers run at once; decisions are still logged in order.
 At the end both books of both setups are advanced to the last date, and every
 outcome whose 10 trading days have passed by today is scored.
 
@@ -30,6 +31,7 @@ import bisect
 import json
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 
@@ -177,6 +179,18 @@ def run_pair(graph, checkpoint_dir, cache: dict, ticker: str, day: date, version
     return rec.structured.get("pm_decision"), final
 
 
+def decide(graph, checkpoint_dir, cache: dict, ticker: str, day: date, version: str,
+           portfolio: str, memo: dict | None) -> tuple[dict | None, dict, int]:
+    """Run the risk stage, retrying once if the PM is unparseable; (PM fields or None, final state, retries)."""
+    for attempt in range(1, PM_ATTEMPTS + 1):
+        fields, final = run_pair(graph, checkpoint_dir, cache, ticker, day, version, portfolio, memo, attempt)
+        if fields is not None:
+            return fields, final, attempt - 1
+        if attempt < PM_ATTEMPTS:
+            logger.warning("%s %s %s: no structured PM decision; retrying once", version, ticker, day)
+    return None, final, PM_ATTEMPTS - 1
+
+
 def advance_book(con, **kwargs) -> None:
     """Advance one book; raise when a missing price stops it (later days would see a stale book)."""
     report = advance(con, **kwargs)
@@ -195,7 +209,7 @@ def score_due(con, **kwargs) -> int:
 
 def run(db_path, graph, *, tickers=None, through: date | None = None, cycle_days: int = CYCLE_DAYS,
         checkpoint_dir=None, calendar: list[date] | None = None, price_provider=None,
-        calibrate=run_cycle) -> dict:
+        calibrate=run_cycle, workers: int = 1) -> dict:
     """Replay every cached date up to ``through`` for both setups; returns counts of what was done."""
     if calendar is None:
         from shadow.data.conditions import trading_calendar
@@ -243,39 +257,47 @@ def run(db_path, graph, *, tickers=None, through: date | None = None, cycle_days
                 else:
                     logger.warning("calibration %s: %s, the previous memo stays current (%s)",
                                    day, result["status"], result.get("error") or "see calibration_attempts")
+            # The day's pairs only read the books as of this morning, so they can run at once; the
+            # database is read and written here, in one thread, in a fixed order.
+            jobs = []
             for version in VERSIONS:
                 advance_book(con, experiment_version=version, book="decision", to_date=day,
                              decisions_through=before, **sim)
                 memo = current_memo(con, day, FEEDBACK) if version == FEEDBACK else None
-                for run_id, ticker, action in pending_pairs(con, version, day, tickers):
-                    portfolio = portfolio_block(con, version, ticker, day)
-                    cache = load_cache(con, run_id, ticker, day)
-                    for attempt in range(1, PM_ATTEMPTS + 1):
-                        fields, final = run_pair(graph, checkpoint_dir, cache, ticker, day, version,
-                                                 portfolio, memo, attempt)
-                        if fields is not None:
-                            break
-                        if attempt < PM_ATTEMPTS:
-                            logger.warning("%s %s %s: no structured PM decision; retrying once", version, ticker, day)
-                            done["pm_retries"] += 1
-                    if fields is None:
-                        # The protocol: retry once, then record Hold. Ratings stay NULL (none were given).
-                        logger.warning("%s %s %s: PM still unparseable; recording Hold", version, ticker, day)
-                        text = final.get("final_trade_decision") or ""
-                        insert_decision(con, run_id=run_id, experiment_version=version, verdict="rejected",
-                                        proposed_size=1.0, final_size=0.0, risk_ratings=None, main_reason="none",
-                                        explanation=f"{UNPARSED_NOTE} {text}".strip(),
-                                        pm_rating="Hold", memo_id=final.get("risk_memo_id"))
-                        done["pm_fallback_holds"] += 1
-                        done["decisions"] += 1
-                        continue
-                    size, verdict, rating = sized_decision(action, fields["rating"])
-                    insert_decision(con, run_id=run_id, experiment_version=version, verdict=verdict,
-                                    proposed_size=1.0, final_size=size,
-                                    risk_ratings={c: fields[c] for c in CATEGORIES},
-                                    main_reason=fields["main_reason"], explanation=final["final_trade_decision"],
-                                    pm_rating=rating, memo_id=final["risk_memo_id"])
+                jobs += [(version, run_id, ticker, action, load_cache(con, run_id, ticker, day),
+                          portfolio_block(con, version, ticker, day), memo)
+                         for run_id, ticker, action in pending_pairs(con, version, day, tickers)]
+            by_ticker = {}
+            for job in jobs:
+                by_ticker.setdefault(job[2], []).append(job)
+            # One thread per ticker: its setups share a checkpoint file, so they run one after another.
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                decided = pool.map(lambda js: [decide(graph, checkpoint_dir, cache, ticker, day, version,
+                                                      portfolio, memo)
+                                               for version, _, ticker, _, cache, portfolio, memo in js],
+                                   by_ticker.values())
+                results = {t: iter(r) for t, r in zip(by_ticker, decided)}
+            for version, run_id, ticker, action, _, _, _ in jobs:
+                fields, final, retries = next(results[ticker])
+                done["pm_retries"] += retries
+                if fields is None:
+                    # The protocol: retry once, then record Hold. Ratings stay NULL (none were given).
+                    logger.warning("%s %s %s: PM still unparseable; recording Hold", version, ticker, day)
+                    text = final.get("final_trade_decision") or ""
+                    insert_decision(con, run_id=run_id, experiment_version=version, verdict="rejected",
+                                    proposed_size=1.0, final_size=0.0, risk_ratings=None, main_reason="none",
+                                    explanation=f"{UNPARSED_NOTE} {text}".strip(),
+                                    pm_rating="Hold", memo_id=final.get("risk_memo_id"))
+                    done["pm_fallback_holds"] += 1
                     done["decisions"] += 1
+                    continue
+                size, verdict, rating = sized_decision(action, fields["rating"])
+                insert_decision(con, run_id=run_id, experiment_version=version, verdict=verdict,
+                                proposed_size=1.0, final_size=size,
+                                risk_ratings={c: fields[c] for c in CATEGORIES},
+                                main_reason=fields["main_reason"], explanation=final["final_trade_decision"],
+                                pm_rating=rating, memo_id=final["risk_memo_id"])
+                done["decisions"] += 1
         if dates:
             for version in VERSIONS:
                 for book in ("decision", "shadow"):
@@ -300,6 +322,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="refuse to start more risk-stage LLM runs than this (default 1)")
     parser.add_argument("--max-cycles", type=int, default=0,
                         help="refuse to start more calibration cycles than this (default 0)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="tickers decided in parallel within a day (default 1)")
     parser.add_argument("--dry-run", action="store_true", help="only report what would run")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -345,7 +369,8 @@ def main(argv: list[str] | None = None) -> int:
     usage = UsageCounter()
     graph = TradingAgentsGraph(selected_analysts=ANALYSTS, config=config, callbacks=[usage])
     spend_before = openrouter_spend()
-    done = run(path, graph, tickers=tickers, through=args.through, cycle_days=args.cycle_days, calendar=calendar)
+    done = run(path, graph, tickers=tickers, through=args.through, cycle_days=args.cycle_days, calendar=calendar,
+               workers=max(1, args.workers))
     spent = spend_since(spend_before)
     print(f"done: {done}; risk-stage usage {usage.as_dict()}")
     print(f"OpenRouter spend: {f'${spent:.4f}' if spent is not None else 'unknown'} (key total, includes calibration)")

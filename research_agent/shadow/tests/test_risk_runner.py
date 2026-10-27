@@ -237,6 +237,36 @@ def test_a_pm_that_parses_on_the_retry_is_logged_normally(setup, tmp_path, monke
 
 
 @pytest.mark.unit
+def test_parallel_workers_log_the_same_decisions_in_the_same_order(tmp_path, monkeypatch):
+    import threading
+
+    threads = {}                                                      # day -> threads that ran its pairs
+    real_run_pair = risk_runner.run_pair
+
+    def run_pair(graph, checkpoint_dir, cache, ticker, day, *args, **kwargs):
+        threads.setdefault(day, set()).add(threading.current_thread().name)
+        return real_run_pair(graph, checkpoint_dir, cache, ticker, day, *args, **kwargs)
+    monkeypatch.setattr(risk_runner, "run_pair", run_pair)
+
+    logged = {}
+    for workers in (1, 3):
+        root = tmp_path / f"w{workers}"
+        root.mkdir()
+        path = _build(root, monkeypatch)
+        threads.clear()
+        _run(path, _graph(root, monkeypatch, FakeModel(decision=_decision("Overweight"))), root, [],
+             workers=workers)
+        con = connect(path, read_only=True)
+        logged[workers] = con.execute(
+            "SELECT experiment_version, ticker, trade_date, part, verdict, pm_rating, final_size, "
+            "memo_id IS NOT NULL FROM decisions ORDER BY rowid").fetchall()
+        con.close()
+        # NVDA and AAPL get a thread each per day with 3 workers
+        assert {len(t) for t in threads.values()} == {1 if workers == 1 else 2}
+    assert logged[1] == logged[3] and len(logged[1]) == 3 * 2 * len(CACHED)
+
+
+@pytest.mark.unit
 def test_cache_files_are_found_through_runs_cache_file(tmp_path, monkeypatch):
     path = _build(tmp_path, monkeypatch, cache_in_db=True)              # like dev.duckdb + sample cache
     model = FakeModel(decision=_decision("Buy"))
@@ -325,7 +355,8 @@ def test_a_pm_that_finished_before_a_crash_is_logged_without_rerunning(setup, tm
 
     done = _run(setup, graph, tmp_path, [], through=CACHED[0])
     assert (done["decisions"], done["pm_retries"], done["pm_fallback_holds"]) == (4, 0, 0)
-    assert sum(isinstance(c, str) for c in model.calls) - pm_calls == 3   # only the 3 pairs never run
+    # A day's pairs all run before any is logged, so all 4 PMs finished before the crash; none re-run.
+    assert sum(isinstance(c, str) for c in model.calls) - pm_calls == 0
     con = connect(setup, read_only=True)
     assert con.execute("SELECT count(*) FROM decisions WHERE risk_volatility IS NULL").fetchone()[0] == 0
     con.close()
