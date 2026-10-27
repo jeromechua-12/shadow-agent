@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Literal
 
+import openai
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, ConfigDict, Field
@@ -21,6 +22,7 @@ CALIBRATION_TEMPERATURE = 0.2   # the protocol fixes every LLM at 0.2; 0.0 made 
 CALIBRATION_MAX_TOKENS = 16384
 MAX_TOOL_STEPS = 12
 RATE_LIMIT_RETRIES = 3
+API_ERROR_CODES = (401, 402, 403, 408, 429)   # key, credit, access, timeout, rate limit
 
 RISK_LEVELS = """Risk level is the overall risk appetite for the next four-week cycle:
 1 Capital preservation: be highly selective; favor strong evidence and contained downside.
@@ -219,8 +221,12 @@ def run_attempt(llm, tools: CalibrationTools, *, as_of: str, experiment_version:
         return AttemptResult(output=None, tool_calls=runtime.calls,
                              error=f"exceeded {MAX_TOOL_STEPS} model turns", status="step_limit")
     except Exception as exc:
+        code = getattr(exc, "status_code", None) or 0
+        # No credit, bad key, rate limit, server or connection trouble: not a model attempt, so the cycle is redone.
+        api = isinstance(exc, openai.APIConnectionError) or code in API_ERROR_CODES or code >= 500
         return AttemptResult(output=None, tool_calls=runtime.calls,
-                             error=f"{type(exc).__name__}: {str(exc)[:2000]}", status="failed")
+                             error=f"{type(exc).__name__}: {str(exc)[:2000]}",
+                             status="api_error" if api else "failed")
 
 
 def build_calibration_llm():

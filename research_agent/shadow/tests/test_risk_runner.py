@@ -309,6 +309,35 @@ def test_a_pm_that_finished_before_a_crash_is_logged_without_rerunning(setup, tm
 
 
 @pytest.mark.unit
+def test_a_calibration_that_hit_an_api_error_stops_the_run_and_is_redone(setup, tmp_path, monkeypatch):
+    def out_of_credit(*, as_of, experiment_version, db_path):
+        con = connect(db_path)
+        append_rows(con, "calibration_attempts", [{
+            "attempt_id": f"att_fail_{as_of}", "calibration_run_id": f"cal_fail_{as_of}",
+            "experiment_version": experiment_version, "cycle_date": as_of, "attempt_no": 1,
+            "created_at": "2026-10-25T00:00:00+00:00", "model": "fake", "status": "api_error",
+            "error": "APIStatusError: Insufficient credits", "safety_passed": False}])
+        con.close()
+
+    graph = _graph(tmp_path, monkeypatch, FakeModel(decision=_decision("Buy")))
+    with pytest.raises(RuntimeError, match="api_error: APIStatusError: Insufficient credits"):
+        risk_runner.run(setup, graph, cycle_days=2, checkpoint_dir=tmp_path / "ckpt", calendar=DAYS,
+                        price_provider=_prices, calibrate=out_of_credit, through=CACHED[2])
+    con = connect(setup, read_only=True)
+    assert con.execute("SELECT count(*) FROM decisions WHERE trade_date = ?", [CACHED[2]]).fetchone() == (0,)
+    con.close()
+
+    cycles = []
+    _run(setup, graph, tmp_path, cycles, through=CACHED[2])             # credit topped up: the cycle is redone
+    assert cycles == [CACHED[2].isoformat()]
+    con = connect(setup, read_only=True)
+    memo_ids = {r[0] for r in con.execute("SELECT memo_id FROM decisions WHERE experiment_version = 'feedback' "
+                                          "AND trade_date = ?", [CACHED[2]]).fetchall()}
+    con.close()
+    assert len(memo_ids) == 1 and None not in memo_ids                  # that day's trades used the new memo
+
+
+@pytest.mark.unit
 def test_a_restart_skips_logged_decisions(setup, tmp_path, monkeypatch):
     model = FakeModel(decision=_decision("Buy"))
     graph = _graph(tmp_path, monkeypatch, model)

@@ -51,6 +51,7 @@ logger = logging.getLogger(__name__)
 VERSIONS = ("original", "feedback")
 FEEDBACK = "feedback"
 CYCLE_DAYS = 20
+RETRY_STATUSES = ("api_error", "not_configured")   # calibration attempts a rerun must redo
 PM_ATTEMPTS = 2   # a PM output that cannot be parsed is retried once, then logged as Hold
 UNPARSED_NOTE = "PM output unparseable after one retry; recorded as Hold."
 #: Final size per Trader action and PM rating (proposed size is always 1.0); any other rating rejects.
@@ -71,9 +72,9 @@ def schedule(con, through: date | None = None, cycle_days: int = CYCLE_DAYS) -> 
 
 
 def calibrated(con, day: date) -> bool:
-    """True if the feedback setup already ran a calibration cycle on ``day``."""
-    return con.execute("SELECT 1 FROM calibration_attempts WHERE experiment_version = ? AND cycle_date = ?",
-                       [FEEDBACK, day]).fetchone() is not None
+    """True if the feedback setup already ran a calibration cycle on ``day``; API or key failures do not count."""
+    return con.execute("SELECT 1 FROM calibration_attempts WHERE experiment_version = ? AND cycle_date = ? "
+                       f"AND status NOT IN {RETRY_STATUSES}", [FEEDBACK, day]).fetchone() is not None
 
 
 def pending_pairs(con, version: str, day: date, tickers=None) -> list[tuple[str, str, str]]:
@@ -216,6 +217,13 @@ def run(db_path, graph, *, tickers=None, through: date | None = None, cycle_days
                 con.close()
                 result = calibrate(as_of=day.isoformat(), experiment_version=FEEDBACK, db_path=db_path) or {}
                 con = connect(db_path)
+                if not calibrated(con, day):
+                    # Trading on without this cycle's memo could not be undone, so stop; a rerun redoes the cycle.
+                    status, error = con.execute(
+                        "SELECT status, error FROM calibration_attempts WHERE experiment_version = ? AND cycle_date = ? "
+                        "ORDER BY created_at DESC LIMIT 1", [FEEDBACK, day]).fetchone() or ("no attempt", None)
+                    raise RuntimeError(f"calibration {day} did not run ({status}: {error}); "
+                                       "check the API key or credit and rerun, this cycle will be redone")
                 done["cycles"] += 1
                 if result.get("status", "memo_written") == "memo_written":
                     logger.info("calibration %s: memo %s written", day, result.get("memo_id"))

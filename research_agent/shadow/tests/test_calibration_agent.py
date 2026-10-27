@@ -1,5 +1,8 @@
 import json
 
+import httpx
+import openai
+import pytest
 from langchain_core.messages import AIMessage
 
 from shadow.data.calibration_agent import _parse_json, run_attempt
@@ -63,6 +66,36 @@ def test_attempt_calls_read_only_tools_then_returns_structured_output():
     assert set(result.output.advice) == set(CATEGORIES)
     assert [call["tool"] for call in result.tool_calls] == ["cycle_summary", "past_memos"]
     assert [call["seq"] for call in result.tool_calls] == [1, 2]
+
+
+_REQUEST = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+
+
+class FailingLLM:
+    def __init__(self, exc):
+        self.exc = exc
+
+    def bind_tools(self, _tools):
+        return self
+
+    def invoke(self, _messages):
+        raise self.exc
+
+
+@pytest.mark.parametrize("exc, status", [
+    (openai.APIStatusError("Insufficient credits", response=httpx.Response(402, request=_REQUEST), body=None),
+     "api_error"),
+    (openai.APIConnectionError(request=_REQUEST), "api_error"),
+    (openai.InternalServerError("upstream down", response=httpx.Response(502, request=_REQUEST), body=None),
+     "api_error"),
+    (openai.BadRequestError("prompt too long", response=httpx.Response(400, request=_REQUEST), body=None),
+     "failed"),                                                     # a rerun would fail the same way
+    (ValueError("model response did not contain a valid JSON object"), "failed"),
+])
+def test_api_trouble_is_told_apart_from_a_failed_model_attempt(exc, status):
+    result = run_attempt(FailingLLM(exc), FakeTools(), as_of="2026-09-28",
+                         experiment_version="v", previous_risk_level=3, attempt_no=1)
+    assert (result.output, result.status) == (None, status)
 
 
 def test_parse_json_extracts_fenced_object_with_surrounding_text():
