@@ -155,6 +155,15 @@ def test_memo_problems_listed(con):
     assert len(e.value.problems) >= 6
 
 
+def test_memo_dry_run_checks_but_writes_nothing(con):
+    kw = {"experiment_version": "v", "memo_text": "x", "advice": ADVICE, "safety_passed": True}
+    assert insert_memo(con, cycle_date="2026-08-31", risk_level=3, dry_run=True, **kw) == \
+        {"memo_id": None, "hypothesis_ids": []}
+    assert con.execute("SELECT count(*) FROM memos").fetchone() == (0,)
+    with pytest.raises(InvalidRecord, match="must start at risk level 3"):
+        insert_memo(con, cycle_date="2026-08-31", risk_level=4, dry_run=True, **kw)
+
+
 def test_two_part_decision_is_all_or_nothing(con, monkeypatch):
     from shadow.data import writers
 

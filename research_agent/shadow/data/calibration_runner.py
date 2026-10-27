@@ -171,35 +171,28 @@ def run_cycle(*, as_of: str, experiment_version: str, db_path=None,
     passing = [(result, safety, records[i]) for i, (result, safety) in enumerate(checked)
                if result.output is not None and safety is not None and safety.passed]
 
-    # Persist every attempt before writing a final memo; failed runs remain auditable.
     write_con = connect(path)
     check_schema_version(write_con, path)
     try:
-        insert_calibration_attempts(write_con, experiment_version=experiment_version,
-                                    cycle_date=cycle_date, calibration_run_id=calibration_run_id,
-                                    attempts=records)
-        if not passing:
-            return {"calibration_run_id": calibration_run_id, "status": "no_valid_memo",
-                    "attempts": len(records), "memo_id": None}
-
-        selected_result, selected_safety, selected_record = max(
-            passing, key=lambda x: (x[1].evidence_score, -x[2]["attempt_no"]))
-        selected_output = _output_with_accepted_level(selected_result.output, selected_safety)
-        advice = {}
-        for category, value in selected_output.advice.items():
-            advice[category] = {
-                "advice": value.advice,
-                "confidence": value.confidence,
-                "reasoning": value.reasoning,
-                "cited_ids": list(dict.fromkeys(value.supporting_ids + value.contradicting_ids)),
-                "supporting_ids": value.supporting_ids,
-                "contradicting_ids": value.contradicting_ids,
-                "conditions": value.conditions,
-                "watch_next": value.watch_next,
-            }
-        try:
-            output = insert_memo(
-                write_con, experiment_version=experiment_version, cycle_date=cycle_date,
+        memo, error = None, None
+        if passing:
+            selected_result, selected_safety, selected_record = max(
+                passing, key=lambda x: (x[1].evidence_score, -x[2]["attempt_no"]))
+            selected_output = _output_with_accepted_level(selected_result.output, selected_safety)
+            advice = {}
+            for category, value in selected_output.advice.items():
+                advice[category] = {
+                    "advice": value.advice,
+                    "confidence": value.confidence,
+                    "reasoning": value.reasoning,
+                    "cited_ids": list(dict.fromkeys(value.supporting_ids + value.contradicting_ids)),
+                    "supporting_ids": value.supporting_ids,
+                    "contradicting_ids": value.contradicting_ids,
+                    "conditions": value.conditions,
+                    "watch_next": value.watch_next,
+                }
+            memo = dict(
+                experiment_version=experiment_version, cycle_date=cycle_date,
                 risk_level=selected_output.risk_level, risk_level_rationale=selected_output.risk_level_rationale,
                 memo_text=render_memo(selected_output, selected_safety, cycle_date, experiment_version),
                 advice=advice, safety_passed=True,
@@ -215,10 +208,25 @@ def run_cycle(*, as_of: str, experiment_version: str, db_path=None,
                 hypothesis_checks=_hypothesis_checks(selected_output, selected_result.tool_calls),
                 tool_calls=selected_result.tool_calls,
             )
-        except InvalidRecord as exc:
-            # The attempt is already stored; a writer rejection means no valid memo, not a crashed replay.
+            try:
+                insert_memo(write_con, **memo, dry_run=True)
+            except InvalidRecord as exc:
+                # Kept on the attempt, so the database itself says why this cycle has no memo.
+                memo, error = None, "; ".join(exc.problems)
+                selected_record.update(status="memo_rejected", safety_passed=False, safety_blockers=[
+                    *selected_record["safety_blockers"], {"code": "writer_rejected", "problems": exc.problems}])
+
+        # Persist every attempt before writing a final memo; failed runs remain auditable.
+        insert_calibration_attempts(write_con, experiment_version=experiment_version,
+                                    cycle_date=cycle_date, calibration_run_id=calibration_run_id,
+                                    attempts=records)
+        if not passing:
+            return {"calibration_run_id": calibration_run_id, "status": "no_valid_memo",
+                    "attempts": len(records), "memo_id": None}
+        if memo is None:
             return {"calibration_run_id": calibration_run_id, "status": "memo_rejected",
-                    "attempts": len(records), "memo_id": None, "error": "; ".join(exc.problems)}
+                    "attempts": len(records), "memo_id": None, "error": error}
+        output = insert_memo(write_con, **memo)
         return {"calibration_run_id": calibration_run_id, "status": "memo_written",
                 "attempts": len(records), "selected_attempt_id": selected_record["attempt_id"],
                 **output}

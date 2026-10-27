@@ -1,5 +1,7 @@
 """Calibration runner: one model attempt per cycle. Fake attempt; nothing touches the network."""
 
+import json
+
 from shadow.data import calibration_runner
 from shadow.data.calibration_agent import AttemptResult
 from shadow.data.db import connect, init_db
@@ -46,7 +48,31 @@ def test_a_memo_the_writer_rejects_is_reported_not_raised(tmp_path, monkeypatch)
                                           llm=object())
     assert result["status"] == "memo_rejected" and result["error"] == "writer said no"
     con = connect(path, read_only=True)
-    assert con.execute("SELECT count(*) FROM calibration_attempts").fetchone() == (1,)
+    status, passed, blockers = con.execute(
+        "SELECT status, safety_passed, safety_blockers FROM calibration_attempts").fetchone()
+    con.close()
+    assert (status, passed) == ("memo_rejected", False)               # the row explains the missing memo
+    assert {"code": "writer_rejected", "problems": ["writer said no"]} in json.loads(blockers)
+
+
+def test_a_valid_attempt_writes_one_memo(tmp_path, monkeypatch):
+    from shadow.data.calibration_models import CATEGORIES, CalibrationOutput
+
+    path = tmp_path / "c.duckdb"
+    init_db(path).close()
+    output = CalibrationOutput.model_validate({
+        "summary": "Evidence is mixed.", "risk_level": 3, "risk_level_rationale": "First cycle.",
+        "advice": {c: {"advice": "keep", "confidence": "low", "reasoning": "Thin."} for c in CATEGORIES}})
+    calls = [{"seq": 1, "tool": "cycle_summary", "args": {}, "result": {}},
+             {"seq": 2, "tool": "past_memos", "args": {}, "result": {"memos": [], "hypotheses": []}}]
+    monkeypatch.setattr(calibration_runner, "run_attempt",
+                        lambda model, tools, **kw: AttemptResult(output=output, tool_calls=calls))
+    result = calibration_runner.run_cycle(as_of="2026-09-28", experiment_version="feedback", db_path=path,
+                                          llm=object())
+    assert result["status"] == "memo_written"
+    con = connect(path, read_only=True)
+    assert con.execute("SELECT memo_id FROM memos").fetchall() == [(result["memo_id"],)]
+    assert con.execute("SELECT status, safety_passed FROM calibration_attempts").fetchone() == ("ok", True)
     con.close()
 
 

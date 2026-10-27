@@ -345,6 +345,7 @@ def insert_memo(
     advice: dict, safety_passed: bool, risk_level_rationale: str | None = None,
     safety_flags: dict | None = None, model: str | None = None,
     hypotheses: list | None = None, hypothesis_checks: list | None = None, tool_calls: list | None = None,
+    dry_run: bool = False,
 ) -> dict:
     """Record a Calibration Agent memo and everything behind it, in one transaction.
 
@@ -358,7 +359,8 @@ def insert_memo(
 
     Hard limits are enforced: risk level 1-5, at most one step from the previous
     memo, and no step up while the decision book is more than 10% below its peak.
-    Returns {"memo_id": ..., "hypothesis_ids": [...]}.
+    Returns {"memo_id": ..., "hypothesis_ids": [...]}. ``dry_run`` runs every check, writes
+    nothing and returns {"memo_id": None, "hypothesis_ids": []}.
     """
     problems: list[str] = []
     cycle = _as_date(cycle_date, "cycle_date", problems)
@@ -430,6 +432,8 @@ def insert_memo(
                             f"a check must come from a later cycle than that")
     if problems:
         raise InvalidRecord("memo", problems)
+    if dry_run:
+        return {"memo_id": None, "hypothesis_ids": []}
 
     memo_id = _new_id("memo")
     hyp_rows = [{"hypothesis_id": _new_id("hyp"), "memo_id": memo_id, "category": h.get("category"),
