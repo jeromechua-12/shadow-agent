@@ -202,7 +202,8 @@ def run(db_path, graph, *, tickers=None, through: date | None = None, cycle_days
         dates, cycles = schedule(con, through, cycle_days)
         if late := late_pairs(con, dates, tickers):
             raise RuntimeError(f"{len(late)} proposal(s) are dated before their books' last snapshot, so their "
-                               f"fills would be lost (e.g. {late[:3]}); run all tickers in one pass on a fresh database")
+                               f"fills would be lost (e.g. {[(v, t, d.isoformat()) for v, t, d in late[:3]]}); "
+                               "run all tickers in one pass on a fresh database")
         for day in dates:
             i = bisect.bisect_left(days, day)
             before = days[i - 1] if i else None
