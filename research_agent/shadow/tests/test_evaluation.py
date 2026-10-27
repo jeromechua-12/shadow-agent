@@ -47,7 +47,8 @@ def con(tmp_path):
         {"decision_id": i, "run_id": r, "experiment_version": v, "ticker": RUNS[r][0], "trade_date": RUNS[r][1],
          "decided_at": f"{RUNS[r][1]}T20:00:00+00:00", "part": part, "verdict": verdict,
          "proposed_action": "Buy", "direction": 1, "proposed_size": 1.0, "final_size": 1.0, "part_size": size,
-         "pm_rating": "Buy"} for i, r, v, verdict, part, size, _, _ in TRADES])
+         "pm_rating": {"approved": "Buy", "reduced": "Overweight", "rejected": "Hold"}[verdict]}
+        for i, r, v, verdict, part, size, _, _ in TRADES])
     append_rows(con, "outcomes", [
         {"decision_id": i, "entry_date": RUNS[r][1], "resolved_on": "2026-09-25", "stock_return": score,
          "spy_return": 0.0, "score": score, "label": label} for i, r, *_, score, label in TRADES])
@@ -122,12 +123,50 @@ def test_wilcoxon_reports_none_when_all_differences_are_zero():
 
 
 def test_decision_quality_on_shared_stock_dates_without_noise(con):
-    orig = evaluation.decision_quality(con, "original")
+    orig = evaluation.decision_quality(con, "original", _spy)
     assert orig == {"rejections_scored": 1, "rejection_precision": 1.0, "net_rejection_value": pytest.approx(0.04),
                     "approvals_scored": 1, "approval_loss_rate": 0.0}
-    fb = evaluation.decision_quality(con, "feedback")     # F3 (MSFT, not shared) and F4 (noise) excluded
+    fb = evaluation.decision_quality(con, "feedback", _spy)     # F3 (MSFT, not shared) and F4 (noise) excluded
     assert fb == {"rejections_scored": 1, "rejection_precision": 0.0, "net_rejection_value": pytest.approx(-0.015),
                   "approvals_scored": 2, "approval_loss_rate": 0.5}
+
+
+def test_net_rejection_value_counts_only_what_the_rejection_changed_in_the_book(tmp_path):
+    con = init_db(tmp_path / "book.duckdb")
+    day, entry = "2026-09-08", "2026-09-09"
+    # ticker: (action, pm_rating, verdict, [(part, part_size)], stock return vs SPY)
+    cases = {"XOM": ("Sell", "Hold", "rejected", [("rejected_part", 1.0)], 0.03),          # nothing held: 0
+             "JNJ": ("Sell", "Underweight", "reduced", [("approved_part", 0.5), ("rejected_part", 0.5)], 0.02),
+             "TSLA": ("Buy", "Hold", "rejected", [("rejected_part", 1.0)], -0.05)}
+    append_rows(con, "runs", [{"run_id": t, "ticker": t, "trade_date": day, "started_at": "2026-10-22T10:00:00+00:00",
+                               "cache_version": 1, "complete": True} for t in cases])
+    decisions, outcomes = [], []
+    for v in ("original", "feedback"):
+        for t, (action, rating, verdict, parts, excess) in cases.items():
+            direction = 1 if action == "Buy" else -1
+            for part, size in parts:
+                i = f"{v}_{t}_{part}"
+                decisions.append({"decision_id": i, "run_id": t, "experiment_version": v, "ticker": t,
+                                  "trade_date": day, "decided_at": f"{day}T20:00:00+00:00", "part": part,
+                                  "verdict": verdict, "proposed_action": action, "direction": direction,
+                                  "proposed_size": 1.0, "final_size": 1.0 - parts[-1][1], "part_size": size,
+                                  "pm_rating": rating})
+                score = direction * excess
+                label = (("correct_approval" if score > 0 else "approval_loss") if part == "approved_part"
+                         else ("missed_gain" if score > 0 else "correct_rejection"))
+                outcomes.append({"decision_id": i, "entry_date": entry, "resolved_on": "2026-09-23",
+                                 "stock_return": excess, "spy_return": 0.0, "score": score, "label": label})
+        # $10,000 per ticker at a $100 entry open: 80 JNJ shares = 0.8 of a position, 50 TSLA = 0.5.
+        append_rows(con, "book_snapshots", [{"snapshot_date": day, "book": "decision", "experiment_version": v,
+                                             "cash": 0.0, "value": 100_000.0, "drawdown": 0.0,
+                                             "positions": {"JNJ": 80.0, "TSLA": 50.0}}])
+    append_rows(con, "decisions", decisions)
+    append_rows(con, "outcomes", outcomes)
+
+    prices = lambda t, as_of: pd.DataFrame({"Date": [entry], "Open": [100.0]})   # noqa: E731
+    # XOM 0; JNJ kept 0.4 that approving would have sold: 0.4 x 0.02; TSLA approving adds 0.5: 0.5 x 0.05.
+    assert evaluation.decision_quality(con, "original", prices)["net_rejection_value"] == pytest.approx(0.033)
+    con.close()
 
 
 def test_evaluate_scores_all_three_setups(con):

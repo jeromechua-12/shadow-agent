@@ -72,7 +72,8 @@
 
 # Evaluation Metrics
 - Rejection precision = correct rejections / (correct rejections + missed gains)
-- Net value of rejections (avoided loss - missed gain) 
+- Net value of rejections (avoided loss - missed gain), measured on the decision book's actual position change
+  (a rejection that changes nothing in the book counts zero)
 - Approval loss rate = approval losses / (approval losses + correct approvals)
 
 # Evaluation Setups

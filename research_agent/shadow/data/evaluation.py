@@ -25,7 +25,7 @@ from scipy.stats import wilcoxon
 
 from shadow.data.risk_runner import VERSIONS
 from shadow.data.writers import InvalidRecord, outcome_dates
-from shadow.sim.config import DEFAULT, SimConfig
+from shadow.sim.config import DEFAULT, KEEP_FRACTION, TARGET_SIZE, SimConfig
 
 PriceProvider = Callable[[str, str], pd.DataFrame]  # (ticker, as_of) -> OHLCV rows up to as_of
 SPY = "spy_buy_and_hold"
@@ -99,8 +99,16 @@ def wilcoxon_test(a: pd.Series, b: pd.Series) -> dict:
     return {"weeks": len(diff), "median_diff": float(diff.median()) if len(diff) else None, "p_value": p}
 
 
-def decision_quality(con: duckdb.DuckDBPyConnection, version: str) -> dict:
-    """Rejection precision, net rejection value and approval loss rate on stock-dates all versions decided."""
+def book_position(rating: str | None, held: float, config: SimConfig = DEFAULT) -> float:
+    """Position after ``rating`` (in per-ticker allocations) when ``held`` is held, as the simulator moves it."""
+    if rating in TARGET_SIZE:
+        return min(TARGET_SIZE[rating], config.max_position)
+    return held * KEEP_FRACTION.get(rating, 1.0)   # Underweight halves; Hold keeps what is held
+
+
+def decision_quality(con: duckdb.DuckDBPyConnection, version: str, price_provider: PriceProvider) -> dict:
+    """Rejection precision, net rejection value and approval loss rate on stock-dates all versions decided.
+    Net rejection value counts each rejection by what it changed in the decision book, not by part size."""
     placeholders = ", ".join("?" for _ in VERSIONS)
     rows = con.execute(f"""
         WITH shared AS (
@@ -108,20 +116,39 @@ def decision_quality(con: duckdb.DuckDBPyConnection, version: str) -> dict:
           WHERE experiment_version IN ({placeholders})
           GROUP BY ticker, trade_date
           HAVING count(DISTINCT experiment_version) = {len(VERSIONS)})
-        SELECT o.label, count(*), sum(-o.score * d.part_size)
+        SELECT o.label, d.part, d.ticker, d.proposed_action, d.pm_rating, o.entry_date,
+               o.stock_return - o.spy_return,
+               (SELECT arg_max(b.positions, b.snapshot_date) FROM book_snapshots b
+                WHERE b.experiment_version = d.experiment_version AND b.book = 'decision'
+                  AND b.snapshot_date <= d.trade_date)
         FROM decisions d
         JOIN shared s USING (ticker, trade_date)
         JOIN outcomes o USING (decision_id)
-        WHERE d.experiment_version = ? AND o.label <> 'noise'
-        GROUP BY o.label""", [*VERSIONS, version]).fetchall()
-    n = {label: count for label, count, _ in rows}
-    avoided = {label: value for label, _, value in rows}
+        WHERE d.experiment_version = ? AND o.label <> 'noise'""", [*VERSIONS, version]).fetchall()
+    n = {}
+    frames, avoided = {}, 0.0
+    for label, part, ticker, action, rating, entry, excess, positions in rows:
+        n[label] = n.get(label, 0) + 1
+        if part != "rejected_part":
+            continue
+        positions = json.loads(positions) if isinstance(positions, str) else (positions or {})
+        shares = positions.get(ticker, 0.0)
+        held = 0.0
+        if shares:
+            if ticker not in frames:
+                df = price_provider(ticker, max(r[5] for r in rows).isoformat())
+                frames[ticker] = df.set_index(df["Date"].astype(str).str[:10])
+            # Valued at the entry-day open, where an approved order would have filled.
+            held = shares * float(frames[ticker].loc[entry.isoformat(), "Open"]) / DEFAULT.per_ticker_allocation
+        # What approving would have added to the book; a rejection that changed nothing counts zero.
+        change = book_position(action, held) - book_position(rating, held)
+        avoided += -change * excess
     cr, mg = n.get("correct_rejection", 0), n.get("missed_gain", 0)
     al, ca = n.get("approval_loss", 0), n.get("correct_approval", 0)
     return {
         "rejections_scored": cr + mg,
         "rejection_precision": cr / (cr + mg) if cr + mg else None,
-        "net_rejection_value": avoided.get("correct_rejection", 0.0) + avoided.get("missed_gain", 0.0),
+        "net_rejection_value": avoided,
         "approvals_scored": al + ca,
         "approval_loss_rate": al / (al + ca) if al + ca else None,
     }
@@ -180,7 +207,7 @@ def evaluate(con: duckdb.DuckDBPyConnection, price_provider: PriceProvider | Non
         "wilcoxon": {"feedback_vs_original": wilcoxon_test(weekly["feedback"], weekly["original"]),
                      "original_vs_spy": wilcoxon_test(weekly["original"], weekly[SPY]),
                      "feedback_vs_spy": wilcoxon_test(weekly["feedback"], weekly[SPY])},
-        "decision_quality": {v: decision_quality(con, v) for v in VERSIONS},
+        "decision_quality": {v: decision_quality(con, v, price_provider) for v in VERSIONS},
     }
 
 
