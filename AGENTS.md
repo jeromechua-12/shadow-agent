@@ -44,6 +44,6 @@ It uses Python 3.13.
 - Treat every work as a task queue, do not drop any task in the queue if I say "no" to something.
 
 # Primary Role
-- Create the wiring for the memo created by the calibration agent and feed it to risk debate and PM layers.
-- Evaluation protocol and setup.
-- If you want to edit existing codes, say your reasoning and ask for permission before writing any code.
+- Evaluate the architecture and determine any flaw when it comes to performing the experiment.
+- Fix the error.
+- It needs to run without error, proper logging according to the architecture loop for all tickers.
