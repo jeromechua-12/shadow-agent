@@ -100,6 +100,15 @@ def late_pairs(con, dates: list[date], tickers=None) -> list[tuple[str, str, dat
     return late
 
 
+def grid_gaps(con, dates: list[date], calendar: list[date], tickers=None) -> list[tuple[str, date]]:
+    """(ticker, date) with no complete run on a trading day between the first and last cached date."""
+    if not dates:
+        return []
+    have = set(con.execute("SELECT ticker, trade_date FROM current_runs").fetchall())
+    names = tickers or sorted({t for t, _ in have})
+    return [(t, d) for d in calendar if dates[0] <= d <= dates[-1] for t in names if (t, d) not in have]
+
+
 def sized_decision(action: str, pm_rating: str) -> tuple[float, str, str]:
     """(final_size, verdict, rating to log) for a Trader action; a rejected trade is logged as Hold."""
     final = FINAL_SIZE[action].get(pm_rating, 0.0)
@@ -205,6 +214,10 @@ def run(db_path, graph, *, tickers=None, through: date | None = None, cycle_days
             raise RuntimeError(f"{len(late)} proposal(s) are dated before their books' last snapshot, so their "
                                f"fills would be lost (e.g. {[(v, t, d.isoformat()) for v, t, d in late[:3]]}); "
                                "run all tickers in one pass on a fresh database")
+        if gaps := grid_gaps(con, dates, days, tickers):
+            raise RuntimeError(f"{len(gaps)} ticker-date pair(s) have no complete upstream run "
+                               f"(e.g. {[(t, d.isoformat()) for t, d in gaps[:3]]}), which would shift cycle "
+                               "dates; cache them first (cache_runner --rerun-incomplete)")
         for day in dates:
             i = bisect.bisect_left(days, day)
             before = days[i - 1] if i else None
@@ -292,6 +305,8 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     tickers = [t.upper() for t in args.tickers] if args.tickers else None
 
+    from shadow.data.conditions import trading_calendar
+    calendar = trading_calendar()
     path = resolve_db(args.db, args.dev)
     con = connect(path, read_only=True)
     try:
@@ -300,6 +315,7 @@ def main(argv: list[str] | None = None) -> int:
         pairs = sum(len(pending_pairs(con, v, d, tickers)) for d in dates for v in VERSIONS)
         due = sorted(d for d in cycles if not calibrated(con, d))
         late = late_pairs(con, dates, tickers)
+        gaps = grid_gaps(con, dates, calendar, tickers)
     finally:
         con.close()
     print(f"database: {path}")
@@ -309,6 +325,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"refusing: {len(late)} proposal(s) are dated before their books' last snapshot, so their fills "
               f"would be lost (e.g. {[(v, t, d.isoformat()) for v, t, d in late[:3]]}); "
               "run all tickers in one pass on a fresh database")
+        return 2
+    if gaps:
+        print(f"refusing: {len(gaps)} ticker-date pair(s) have no complete upstream run "
+              f"(e.g. {[(t, d.isoformat()) for t, d in gaps[:3]]}), which would shift cycle dates; "
+              "cache them first (cache_runner --rerun-incomplete)")
         return 2
     if args.dry_run:
         return 0
@@ -324,7 +345,7 @@ def main(argv: list[str] | None = None) -> int:
     usage = UsageCounter()
     graph = TradingAgentsGraph(selected_analysts=ANALYSTS, config=config, callbacks=[usage])
     spend_before = openrouter_spend()
-    done = run(path, graph, tickers=tickers, through=args.through, cycle_days=args.cycle_days)
+    done = run(path, graph, tickers=tickers, through=args.through, cycle_days=args.cycle_days, calendar=calendar)
     spent = spend_since(spend_before)
     print(f"done: {done}; risk-stage usage {usage.as_dict()}")
     print(f"OpenRouter spend: {f'${spent:.4f}' if spent is not None else 'unknown'} (key total, includes calibration)")

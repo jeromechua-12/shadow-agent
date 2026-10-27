@@ -267,6 +267,29 @@ def test_a_second_ticker_pass_over_dates_the_books_passed_is_refused(setup, tmp_
 
 
 @pytest.mark.unit
+def test_a_pair_with_only_an_incomplete_run_is_refused(setup, tmp_path, monkeypatch):
+    con = connect(setup)
+    con.execute("UPDATE runs SET complete = false WHERE run_id = ?", [f"AAPL_{CACHED[1]}"])
+    con.close()
+    model = FakeModel(decision=_decision("Buy"))
+    with pytest.raises(RuntimeError, match=r"1 ticker-date pair.*AAPL"):
+        _run(setup, _graph(tmp_path, monkeypatch, model), tmp_path, [])
+    assert model.calls == []                                         # refused before any LLM call
+
+
+@pytest.mark.unit
+def test_a_missing_trading_day_is_refused(setup, tmp_path, monkeypatch):
+    con = connect(setup)
+    con.execute("DELETE FROM trader_proposals WHERE trade_date = ?", [CACHED[2]])
+    con.execute("DELETE FROM runs WHERE trade_date = ?", [CACHED[2]])
+    con.close()
+    model = FakeModel(decision=_decision("Buy"))
+    with pytest.raises(RuntimeError, match="3 ticker-date pair"):    # all three tickers on that day
+        _run(setup, _graph(tmp_path, monkeypatch, model), tmp_path, [])
+    assert model.calls == []
+
+
+@pytest.mark.unit
 def test_a_missing_price_stops_the_run(setup, tmp_path, monkeypatch):
     def prices(ticker, as_of):
         df = _prices(ticker, as_of)
