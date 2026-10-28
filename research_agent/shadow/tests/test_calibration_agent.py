@@ -5,7 +5,7 @@ import openai
 import pytest
 from langchain_core.messages import AIMessage
 
-from shadow.data.calibration_agent import _parse_json, run_attempt
+from shadow.data.calibration_agent import FINAL_PROMPT, MAX_TOOL_STEPS, _parse_json, run_attempt
 from shadow.data.calibration_models import CATEGORIES
 
 
@@ -66,6 +66,29 @@ def test_attempt_calls_read_only_tools_then_returns_structured_output():
     assert set(result.output.advice) == set(CATEGORIES)
     assert [call["tool"] for call in result.tool_calls] == ["cycle_summary", "past_memos"]
     assert [call["seq"] for call in result.tool_calls] == [1, 2]
+
+
+class ToolHungryLLM(FakeLLM):
+    """Calls a tool every turn; answers only when told to (unless ``stubborn``)."""
+
+    def __init__(self, stubborn=False):
+        super().__init__()
+        self.stubborn = stubborn
+
+    def invoke(self, messages):
+        if messages[-1].content == FINAL_PROMPT and not self.stubborn:
+            self.turn = 99
+            return super().invoke(messages)
+        return AIMessage(content="", tool_calls=[{
+            "name": "cycle_summary", "args": {}, "id": f"call_{len(messages)}", "type": "tool_call"}])
+
+
+@pytest.mark.parametrize("stubborn, status", [(False, "ok"), (True, "step_limit")])
+def test_out_of_tool_turns_gets_one_final_answer_turn(stubborn, status):
+    result = run_attempt(ToolHungryLLM(stubborn), FakeTools(), as_of="2026-09-28",
+                         experiment_version="v", previous_risk_level=3, attempt_no=1)
+    assert result.status == status and (result.output is not None) == (not stubborn)
+    assert len(result.tool_calls) == MAX_TOOL_STEPS
 
 
 _REQUEST = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")

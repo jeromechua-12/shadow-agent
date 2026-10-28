@@ -58,9 +58,13 @@ citations, trades, or news, and do not ask to modify the database.
 
 REPAIR_PROMPT = """Your JSON failed the deterministic checks below. Return the full corrected JSON object.
 Fix only these problems and keep the rest of your analysis unchanged. Cite only IDs that appeared
-in a tool result. Keep decimals and percentages out of free text. hypothesis_checks may only use
+in a tool result. Keep decimals and percentages out of all free text, including numeric_claims
+statements (write "credible interval lower bound", not "90% credible interval"). hypothesis_checks may only use
 hypothesis IDs that past_memos returned. You may call tools to look up IDs or numbers.
 Failed checks: """
+
+FINAL_PROMPT = """You have used all your tool turns. Do not call any more tools. Return the final JSON
+object now, using only the evidence already gathered above."""
 
 
 class _Args(BaseModel):
@@ -225,13 +229,18 @@ def repair_attempt(llm, tools: CalibrationTools, prior: AttemptResult, blockers:
 def _agent_loop(bound, runtime: ToolRuntime, messages: list) -> AttemptResult:
     """Run tool turns until the model returns its JSON; API trouble is marked ``api_error``."""
     try:
-        for _ in range(MAX_TOOL_STEPS):
+        for step in range(MAX_TOOL_STEPS + 1):
+            if step == MAX_TOOL_STEPS:
+                # Out of tool turns: one last turn asks for the JSON from the evidence already gathered.
+                messages.append(HumanMessage(content=FINAL_PROMPT))
             response: AIMessage = _invoke(bound, messages)
             messages.append(response)
             calls = getattr(response, "tool_calls", None) or []
             if not calls:
                 output = _parse_json(response.content)
                 return AttemptResult(output=output, tool_calls=runtime.calls, messages=messages)
+            if step == MAX_TOOL_STEPS:
+                break
             for call in calls:
                 seq, result = runtime.execute(call.get("name", ""), call.get("args") or {})
                 messages.append(ToolMessage(

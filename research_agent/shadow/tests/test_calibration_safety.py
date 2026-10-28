@@ -119,6 +119,10 @@ def test_whole_numbers_may_appear_in_text_but_statistics_may_not():
     assert not _codes(output(risk_level_rationale="Hold level 3 on the first cycle; watch 10-day outcomes."), calls)
     assert "unstructured_numeric_claim" in _codes(output(summary="The win rate was 0.62."), calls)
     assert "unstructured_numeric_claim" in _codes(output(summary="The win rate was 62%."), calls)
+    result = validate_output(output(summary="The win rate was 62%."), calls, previous_risk_level=3,
+                             decision_drawdown=0.0, snapshot_date=date(2026, 9, 28), as_of=date(2026, 9, 28))
+    blocker = next(b for b in result.blockers if b["code"] == "unstructured_numeric_claim")
+    assert blocker["found_in"] == ["The win rate was 62%."]          # the repair turn sees what to rewrite
 
 
 def test_85_percent_signal_flags_unexplained_departure_from_prior_advice():

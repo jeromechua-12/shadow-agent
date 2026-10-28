@@ -143,9 +143,11 @@ def validate_output(
             prose.append(advice.conflict_rationale)
     prose.extend(h.statement for h in output.hypotheses)
     prose.extend(claim.statement for claim in output.numeric_claims)
-    if any(UNSTRUCTURED_NUMBER.search(text) for text in prose):
+    if found := [text[:200] for text in prose if UNSTRUCTURED_NUMBER.search(text)]:
+        # Quote the texts, so a repair turn knows what to rewrite (numeric_claims statements count too).
         blockers.append({"code": "unstructured_numeric_claim",
-                         "message": "put numeric facts only in numeric_claims, linked to a tool result"})
+                         "message": "put numeric facts only in numeric_claims, linked to a tool result",
+                         "found_in": found})
 
     for claim in output.numeric_claims:
         call = call_by_seq.get(claim.tool_call_seq)
