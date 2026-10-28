@@ -1,4 +1,4 @@
-"""Run one auditable Calibration Agent cycle (one model attempt, stored with its checks)."""
+"""Run one auditable Calibration Agent cycle (one model attempt plus one repair turn, stored with its checks)."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from shadow.data.calibration_agent import (
     AttemptResult,
     CALIBRATION_MODEL,
     build_calibration_llm,
+    repair_attempt,
     run_attempt,
 )
 from shadow.data.calibration_models import CATEGORIES
@@ -20,7 +21,7 @@ from shadow.data.db import check_schema_version, connect, init_db, resolve_db
 from shadow.data.queries import CalibrationTools
 from shadow.data.writers import InvalidRecord, insert_calibration_attempts, insert_memo
 
-ATTEMPT_COUNT = 1   # the evaluation protocol runs calibration once per point
+ATTEMPT_COUNT = 1   # the evaluation protocol runs calibration once per point; a failed check gets one repair turn
 
 
 def _now() -> str:
@@ -162,6 +163,16 @@ def run_cycle(*, as_of: str, experiment_version: str, db_path=None,
                                       snapshot_date=snapshot_date, as_of=cycle_date)
                       if result.output else None)
             checked.append((result, safety))
+        if not any(safety and safety.passed for _, safety in checked):
+            failed = next(((r, s) for r, s in checked if s is not None), None)
+            if failed:
+                # One repair turn: the agent sees its blockers; the same checks decide on the fix.
+                repaired = repair_attempt(model, query_tools, failed[0], failed[1].blockers)
+                checked.append((repaired, validate_output(repaired.output, repaired.tool_calls,
+                                                          previous_risk_level=previous_level,
+                                                          decision_drawdown=drawdown,
+                                                          snapshot_date=snapshot_date, as_of=cycle_date)
+                                if repaired.output else None))
     finally:
         read_con.close()
 

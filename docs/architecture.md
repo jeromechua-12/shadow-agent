@@ -64,6 +64,7 @@
     - Upstream only: one automatic retry at 0.6 when an agent loops and returns nothing
   - Risk stage runs once per stock, date and setup
   - Calibration runs once per point (one attempt per cycle)
+    - If its output fails the safety checks, the agent gets one repair turn with the failed checks; the same checks decide
 - **Statistical testing**
   - Bootstrap CIs on Sharpe ratio from weekly results
   - Wilcoxon signed-rank test on weekly return differences

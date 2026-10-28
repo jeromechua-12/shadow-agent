@@ -56,6 +56,12 @@ citations, trades, or news, and do not ask to modify the database.
 
 """ + RISK_LEVELS
 
+REPAIR_PROMPT = """Your JSON failed the deterministic checks below. Return the full corrected JSON object.
+Fix only these problems and keep the rest of your analysis unchanged. Cite only IDs that appeared
+in a tool result. Keep decimals and percentages out of free text. hypothesis_checks may only use
+hypothesis IDs that past_memos returned. You may call tools to look up IDs or numbers.
+Failed checks: """
+
 
 class _Args(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -91,6 +97,7 @@ class AttemptResult:
     tool_calls: list[dict]
     error: str | None = None
     status: str = "ok"
+    messages: list = field(default_factory=list)   # the conversation, so a repair turn can continue it
 
 
 @dataclass
@@ -193,7 +200,6 @@ def _parse_json(content) -> CalibrationOutput:
 def run_attempt(llm, tools: CalibrationTools, *, as_of: str, experiment_version: str,
                 previous_risk_level: int | None, attempt_no: int) -> AttemptResult:
     runtime = ToolRuntime(tools)
-    bound = llm.bind_tools(runtime.specs)
     user_payload = {
         "as_of": as_of,
         "experiment_version": experiment_version,
@@ -204,14 +210,28 @@ def run_attempt(llm, tools: CalibrationTools, *, as_of: str, experiment_version:
     }
     messages = [SystemMessage(content=SYSTEM_PROMPT),
                 HumanMessage(content=json.dumps(user_payload, ensure_ascii=False))]
+    return _agent_loop(llm.bind_tools(runtime.specs), runtime, messages)
+
+
+def repair_attempt(llm, tools: CalibrationTools, prior: AttemptResult, blockers: list[dict]) -> AttemptResult:
+    """Give the agent one turn to fix the blockers its output failed; tool calls keep their numbering."""
+    runtime = ToolRuntime(tools)
+    runtime.calls = list(prior.tool_calls)
+    messages = [*prior.messages,
+                HumanMessage(content=REPAIR_PROMPT + json.dumps(blockers, ensure_ascii=False, default=str))]
+    return _agent_loop(llm.bind_tools(runtime.specs), runtime, messages)
+
+
+def _agent_loop(bound, runtime: ToolRuntime, messages: list) -> AttemptResult:
+    """Run tool turns until the model returns its JSON; API trouble is marked ``api_error``."""
     try:
         for _ in range(MAX_TOOL_STEPS):
             response: AIMessage = _invoke(bound, messages)
+            messages.append(response)
             calls = getattr(response, "tool_calls", None) or []
             if not calls:
                 output = _parse_json(response.content)
-                return AttemptResult(output=output, tool_calls=runtime.calls)
-            messages.append(response)
+                return AttemptResult(output=output, tool_calls=runtime.calls, messages=messages)
             for call in calls:
                 seq, result = runtime.execute(call.get("name", ""), call.get("args") or {})
                 messages.append(ToolMessage(
